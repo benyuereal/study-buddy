@@ -12,6 +12,14 @@
 | 共享内存 | LDS = **64 KB / CU** | 48-164 KB / SM | 分块参数第一硬约束，超出编译报错 |
 | LDS Bank 数量 | 32 | 32 | Bank Conflict 相关（见第三章） |
 
+
+
+
+```python
+
+```
+
+
 ![DCU架构 - 计算子系统ComputeUnit硬件结构图](assets/cu.png)
 
 > CU 内部结构很复杂，但写 TileLang 时只需要盯三个数字：**LDS 64KB**（分块上限）、**Wave 64 线程**（线程数约束）、**Block 上限 1024 线程**。SIMD 调度、VGPR 分配均由编译器自动处理，不需要手动干预。
