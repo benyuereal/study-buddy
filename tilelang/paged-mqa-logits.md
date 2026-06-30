@@ -88,6 +88,14 @@ bs1_H64_D128_72k                 1   64  128    72000         0.120         0.08
 - **大 batch（≥64）**：与手写汇编基本持平（0.94x ~ 1.34x），Python DSL 能做到这个性能是编译器自动向量化 + 流水线优化的直接体现。
 - **小 batch（=1）**：比手写汇编慢 1.4x ~ 1.8x。小 batch 时 Grid 太小（max_block_len 个 Block 分散到 80 个 CU，多数 CU 闲置），手写汇编可以做 warp-specialized 的细粒度优化，TileLang 的通用流水线在这个场景下开销占比放大。
 
+在 vLLM 中的 profiler 延迟对比：
+
+![优化前](assets/paged_mqa_logits_pre.png)
+
+![优化后](assets/paged_mqa_logits_after.png)
+
+优化后延迟从 1ms 降至 10μs，**提升数十倍**。
+
 ---
 
 ## 三、数据布局
@@ -322,42 +330,40 @@ for bn_i in T.Parallel(block_N):
 
 ## 七、LDS 容量与配置选择
 
-### 7.1 LDS 预算公式
+DCU LDS 为 64 KB，核心策略：**分块占用控制在 32 KB 以内**，这样 LDS 至少能容纳 2 个 block，通过 `T.Pipelined` 双缓冲隐藏访存延迟。
+
+### LDS 预算公式
 
 ```
-LDS 总占用 = q_smem + (num_stages + 1) × k_smem
+LDS 总占用 = q_smem + K_LDS
            = heads × D × 2 + (num_stages + 1) × block_N × D × 2 bytes
 ```
 
-注意：标准 GEMM 的 LDS 公式是 `num_stages × (A_smem + B_smem)`，这里只有 K 参与流水线（Q 不变），所以 Q 只有 1 份、K 有 `num_stages + 1` 份。
+Q 不参与流水线（只有 1 份），K 有 `num_stages + 1` 份用于双缓冲。
 
-### 7.2 配置选择逻辑
+### 配置选择
 
-`_pick_block_config` 在 `block_N ∈ {32, 64}` × `num_stages ∈ {2, 1, 0}` 的 6 种组合中，优先选 `num_stages` 大的（隐藏访存延迟），其次选 `block_N` 小的（每轮计算量小，更容易和加载重叠）。约束：`total ≤ LDS_LIMIT = 80 KB`。
+在 `block_N ∈ {32, 64}` × `num_stages ∈ {2, 1, 0}` 中，优先 `num_stages` 大（更多缓冲级数隐藏延迟），其次 `block_N` 小（每轮计算量小，与加载更容易重叠）。
 
-`heads=32, D=128` 的 LDS 占用（q_smem = 8 KB）：
+**`heads=32, D=128`**（q_smem = 8 KB）：
 
-| block_N | num_stages | K LDS | 总占用 | 是否可选 |
-|---------|-----------|-------|--------|---------|
-| 32 | 2 | 24 KB | 32 KB | ✓ 最优 |
-| 32 | 1 | 16 KB | 24 KB | ✓ |
-| 64 | 1 | 32 KB | 40 KB | ✓ |
-| 64 | 0 | 16 KB | 24 KB | ✓ |
-| 64 | 2 | 48 KB | 56 KB | ✓ |
+| block_N | num_stages | 总占用 | 说明 |
+|---------|-----------|--------|------|
+| 32 | 2 | 32 KB | 最优：刚好一半 LDS，2 级流水线 |
+| 32 | 1 | 24 KB | 备选 |
+| 64 | 1 | 40 KB | 备选 |
+| 64 | 0 | 24 KB | 无流水线，退而求其次 |
 
-`heads=64, D=128` 的 LDS 占用（q_smem = 16 KB）：
+**`heads=64, D=128`**（q_smem = 16 KB）：
 
-| block_N | num_stages | K LDS | 总占用 | 是否可选 |
-|---------|-----------|-------|--------|---------|
-| 32 | 1 | 16 KB | 32 KB | ✓ |
-| 32 | 0 | 8 KB | 24 KB | ✓ |
-| 64 | 1 | 32 KB | 48 KB | ✓ |
-| 64 | 0 | 16 KB | 32 KB | ✓ |
-| 32 | 2 | 24 KB | 40 KB | ✓ |
+| block_N | num_stages | 总占用 | 说明 |
+|---------|-----------|--------|------|
+| 32 | 1 | 32 KB | 最优：刚好一半 LDS |
+| 32 | 0 | 24 KB | 备选 |
+| 64 | 1 | 48 KB | 超过一半但未超总量 |
+| 64 | 0 | 32 KB | 刚好一半，无流水线 |
 
-### 7.3 FullRow 小 batch 优化
-
-当 `batch_size ≤ 4` 时触发：
+### 小 batch 优化（batch_size ≤ 4）
 
 ```python
 if batch_size <= 4 and block_N == 32:
@@ -367,9 +373,4 @@ if batch_size <= 4 and block_N == 32:
         policy = "full_row"
 ```
 
-**动机**：小 batch → Grid Block 总数小（= max_block_len × batch_size）→ CU 利用率低。这时让每个 Block 多做一点：
-
-- `block_N` 从 32 升到 64：一个 Block 一次处理完整个 logical block，**消除流水线屏障开销**
-- `FullRow` 策略：warp 沿 M 维度排列，每个 warp 独立处理 `[16, 128] × [H, 128]^T` 子块，**无 warp 间通信**
-
-用更多计算换取更少的同步开销——在小 Grid 场景下是净收益。
+小 batch 下 Grid 小、CU 利用率低，牺牲流水线换取单个 Block 处理整块 64 行 KV，配合 `FullRow` 策略消除 warp 间通信——计算换同步开销。
