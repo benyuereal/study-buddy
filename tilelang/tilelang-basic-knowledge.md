@@ -14,41 +14,37 @@
 
 TileLang 是一个**面向 GPU/CPU 高性能计算的领域特定语言（DSL）**，以 Pythonic 语法提供显式的硬件内存管理、线程级并行控制和软件流水线能力。它构建于 TVM 之上，通过多层 IR 逐步降级到硬件特定的可执行代码。
 
-### 三层编程接口
-
-TileLang 提供三种不同抽象层级的编程接口，用户可在同一个 Kernel 中混合使用：
-
-| 层级 | 目标用户 | 特点 |
-|------|---------|------|
-| **Beginner** | 硬件无关开发者 | 无需关心内存层次，专注算法逻辑（尚未完全实现） |
-| **Developer** | 了解 GPU 内存层次的开发者 | 提供 Tile Library，用预定义算子组合 Kernel |
-| **Expert** | 深度理解硬件特性的专家 | 直接控制线程原语、内存布局、同步机制 |
-
-**本文档面向 Expert 层级**，覆盖所有底层原语和线程级控制。
-
 ### 编译流水线
 
 ```
-Python Tile Program
-       │
-       ▼
-  IRModule（TVM 中间表示）
-       │
-       ▼
-  源代码生成（C / CUDA / HIP / LLVM / Metal）
-       │
-       ▼
-  硬件可执行文件（NVIDIA / AMD / DCU / Ascend / Apple）
+TileLang Source Code（Python）
+    │
+    ▼
+[Parsing] → TileLang IR
+    │
+    ▼
+[Lowering] → TIR（Tensor Intermediate Representation）
+    │
+    ▼
+[Optimization Passes]
+    ├─ InferBound（推断循环边界）
+    ├─ StorageRewrite（优化内存分配）
+    ├─ LayoutInference（布局推断）
+    ├─ LowerThreadAllreduce（线程级归约）
+    ├─ InjectDoubleBuffer（双缓冲插入）
+    ├─ VectorizeLoop（循环向量化）
+    └─ ...
+    │
+    ▼
+[Code Generation] → CUDA / ROCm(HIP) / Metal
+    │
+    ▼
+Binary Kernel → GPU 执行
 ```
 
-1. 用户用 Python 编写 Tile Program（包含 `@T.prim_func`、`T.Kernel` 等）
-2. TileLang 编译器将其降级为 TVM IRModule
-3. IR 经布局推断（Layout Inference）、流水线规划、向量化等 Pass 优化后，生成 target-specific 源代码
-4. 最终编译为对应 GPU 后端（CUDA/HIP/Metal/AscendC 等）的可执行文件
+支持 NVIDIA（CUDA）、AMD（ROCm/HIP）、海光 DCU（HCU）、华为昇腾（AscendC）、Apple Metal 等主流 GPU 后端。
 
-**支持的后端**：NVIDIA（CUDA、NVRTC、CuTeDSL）、AMD（HIP/ROCm）、海光 DCU（HCU）、华为昇腾（AscendC、AscendNPU IR）、Apple Metal、WebGPU。
-
-### Tile 作为一等公民
+### 显式内存层级控制
 
 TileLang 的核心思想是将 **Tile（分块）** 作为一等公民。一个 Tile 表示数据中的一个形状化片段，由 warp 或 thread block 独立持有和操作。开发者显式指定：
 
