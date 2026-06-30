@@ -85,100 +85,48 @@ TileLang 的核心思想是将 **Tile（分块）** 作为一等公民。一个 
 
 ---
 
-## 一、函数定义：`@T.prim_func` 与 `@tl.jit`
+## 一、基础骨架
 
-### `@T.prim_func` — 定义 TileLang 原始函数
+**函数装饰器**：`@T.prim_func` 将函数标记为 IR 函数，参数用 `T.Tensor(shape, dtype)` 标注，返回 IR 对象不直接执行；`@tl.jit` 将返回 prim_func 的 Python 工厂函数 JIT 编译为可调用的 GPU kernel，支持 `out_idx` 指定输出参数、`pass_configs` 传递编译选项。
 
-```python
-@T.prim_func
-def my_kernel(
-    A: T.Tensor((M, K), "float16"),
-    B: T.Tensor((N, K), "float16"),
-    C: T.Tensor((M, N), "float16"),
-):
-    with T.Kernel(T.ceildiv(N, 128), T.ceildiv(M, 128), threads=128) as (bx, by):
-        ...
-```
+**Kernel 启动配置**：`T.Kernel(grid_x, grid_y, threads=128) as (bx, by)` 定义 GPU 的 Grid/Block 组织方式，`bx`/`by` 对应 `blockIdx.x`/`blockIdx.y`，`threads` 为每个 Block 内的线程数（DCU 上应为 64 的倍数，最大 1024）。也支持一维 Grid：`T.Kernel(grid_size, threads=...) as (block_id)`。
 
-`@T.prim_func` 是定义 TileLang Kernel 函数的装饰器。被它装饰的函数：
-- 参数必须用 `T.Tensor(shape, dtype)` 或 `T.Buffer` 标注类型和形状
-- 函数体内使用 TileLang DSL 语法（`T.Kernel`、`T.alloc_shared`、`T.copy` 等）
-- 返回的是一个 IR 函数对象，不直接执行，需要交给 `tl.jit` 编译后才能调用
+**编译时工具函数**：`T.dynamic("M N K")` 声明符号变量；`T.ceildiv(a, b)` 向上取整除；`T.min(a, b)` 生成 Min 表达式。三者均在编译时求值，"冻结"为常量传入 prim_func。
 
-它和 `@tl.jit` 的关系：
-- `@T.prim_func` 定义的是**纯 IR 层**函数，不包含任何 Python 运行时逻辑
-- `@tl.jit` 包裹一个**返回 prim_func 的 Python 工厂函数**，负责 JIT 编译和缓存
-
-### `@tl.jit` — JIT 编译装饰器
+下面是一个完整的向量加法示例，把三者串起来：
 
 ```python
-@tl.jit(out_idx=[-1], pass_configs={
-    tl.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
-})
-def my_gemm(M, N, K, block_M, block_N, block_K, ...):
-    # 这里可以写 Python 逻辑：计算 grid_size、定义符号变量等
-    @T.prim_func
-    def kernel(A: T.Tensor(...), B: T.Tensor(...), C: T.Tensor(...)):
-        ...
-    return kernel
+from tilelang import jit
+import tilelang.language as T
+
+@jit
+def add(N: int, block: int = 256, dtype: str = "float32"):
+    @T.prim_func                                         # ❶ 函数装饰器
+    def add_kernel(
+        A: T.Tensor((N,), dtype),
+        B: T.Tensor((N,), dtype),
+        C: T.Tensor((N,), dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block), threads=block) as bx:  # ❷ Kernel 启动配置
+            for i in T.Parallel(block):
+                gi = bx * block + i                       # ❸ 编译时工具函数
+                if gi < N:                                #   T.ceildiv 计算 grid size
+                    C[gi] = A[gi] + B[gi]
+    return add_kernel
 ```
 
-`@tl.jit` 将一个**返回 prim_func 的 Python 函数**包装成可调用的 JIT 编译函数：
+运行输出示例：
 
-- `out_idx=[-1]`：指定函数的第几个参数是"输出"。`[-1]` 表示最后一个参数 C 是输出，编译器会据此做优化（如自动清零输出 buffer）
-- `pass_configs={...}`：传递编译 pass 选项，控制编译优化行为
-- 工厂函数的 Python 参数（如 `block_M`、`block_N`）会在 JIT 编译时被"冻结"为常量，生成特化版本的 Kernel
-- 第一次调用时触发编译并缓存，后续同参数调用直接命中缓存
+```
+[TileLang] completes to compile kernel `add_kernel`
+N=1048576, max_diff=0.000000, passed.
+```
 
-**典型用法**：工厂函数里做 Python 级的计算（如 `T.ceildiv`、`T.min`），把结果作为常量传给 prim_func，prim_func 里只写纯 GPU 逻辑。
+完整代码见 [examples/vector_add.py](examples/vector_add.py)。
 
 ---
 
-## 二、Kernel 启动配置
-
-### `T.Kernel` — 定义 GPU 启动配置
-
-```python
-with T.Kernel(grid_x, grid_y, threads=128) as (bx, by):
-```
-
-`T.Kernel` 支持二维和一维 Grid：
-
-- **二维 Grid**：`T.Kernel(grid_x, grid_y, threads=...) as (bx, by)`，`bx`/`by` 分别对应 `blockIdx.x`/`blockIdx.y`
-- **一维 Grid**：`T.Kernel(grid_size, threads=...) as (block_id)`，常用于持久化 Kernel
-- `threads=128`：每个 Block 内的线程数，**DCU 上应为 64 的倍数，最大 1024**
-
----
-
-## 三、编译时工具函数
-
-### `T.ceildiv` — 向上取整除
-
-```python
-grid_x = T.ceildiv(N, block_N)  # 等价于 ceil(N / block_N)
-```
-
-当矩阵尺寸不能被分块大小整除时，边缘 Block 需要处理"不足一块"的数据（通过边界 `if` 守卫）。
-
-### `T.min` — 取最小值
-
-```python
-grid_size = T.min(m_blocks * n_blocks, wgs_per_cu * cu_num)
-```
-
-`T.min` 生成 TIR 的 Min 表达式，既可出现在 JIT 工厂函数中做编译时常量计算，也可出现在 prim_func 内部生成对应的 GPU min 指令。典型用法是持久化 Kernel 中限制 Block 数量不超过 `wgs_per_cu × cu_num`。
-
-### `T.dynamic` — 定义符号变量
-
-```python
-M, N, K = T.dynamic("M N K")
-```
-
-在 lazy 模式（`@T.prim_func`）中声明编译时符号维度，工厂函数将其"冻结"为常量传入 prim_func。
-
----
-
-## 四、内存分配
+## 二、内存分配
 
 ### `T.alloc_shared` — 分配 Shared Memory 缓冲区
 
@@ -229,7 +177,7 @@ T.fill(buf, value)     # 所有元素填充为 value
 
 ---
 
-## 五、数据搬运
+## 三、数据搬运
 
 ### `T.copy` — 同步数据搬运
 
@@ -276,7 +224,7 @@ T.ptx_wait_group(N)         # 等待还剩 N 组未完成的异步拷贝
 
 ---
 
-## 六、计算
+## 四、计算
 
 ### `T.gemm` — 矩阵乘法原语
 
@@ -363,9 +311,36 @@ result = T.if_then_else(cond, true_val, false_val)
 
 归约操作的累加器需要用 `T.clear` 或 `T.fill` 初始化，结果通常写入 `T.alloc_local` 分配的缓冲区中。
 
+### 第二~四章总结：基础 GEMM
+
+下面用前三章的全部知识——内存分配（`alloc_shared`/`alloc_fragment`/`clear`）、数据搬运（`T.copy`）、计算（`T.gemm`）——组合出一个完整的基础 GEMM（每个 Block 处理一个 tile）：
+
+```python
+@T.prim_func
+def gemm(
+    A: T.Tensor((M, K), "float16"),
+    B: T.Tensor((K, N), "float16"),
+    C: T.Tensor((M, N), "float16"),
+):
+    with T.Kernel(T.ceildiv(N, BN), T.ceildiv(M, BM), threads=128) as (bx, by):
+        A_s = T.alloc_shared((BM, BK), "float16")     # 二、内存分配
+        B_s = T.alloc_shared((BK, BN), "float16")
+        C_f = T.alloc_fragment((BM, BN), "float32")
+        T.clear(C_f)
+
+        for ko in T.Pipelined(T.ceildiv(K, BK), num_stages=3):
+            T.copy(A[by * BM, ko * BK], A_s)           # 三、数据搬运
+            T.copy(B[ko * BK, bx * BN], B_s)
+            T.gemm(A_s, B_s, C_f)                      # 四、计算
+
+        T.copy(C_f, C[by * BM, bx * BN])               # 结果写回
+```
+
+这是 TileLang 最经典的 GEMM 骨架：Global→Shared→gemm→Global。控制流优化（`T.Pipelined`、`T.Persistent`）将在下一章展开。
+
 ---
 
-## 七、控制流
+## 五、控制流
 
 ### 控制流选择总览
 
@@ -478,7 +453,7 @@ for bx, by in T.Persistent(
 
 ---
 
-## 八、布局注解（Layout Annotation）
+## 六、布局注解（Layout Annotation）
 
 ### `T.annotate_layout` — 声明缓冲区的内存布局
 
@@ -517,7 +492,7 @@ tl.layout.make_hcu_swizzled_layout(buffer, major_pack=2)
 
 ---
 
-## 九、同步与线程索引
+## 七、同步与线程索引
 
 ### 同步原语
 
@@ -547,7 +522,7 @@ tx, ty = T.get_thread_bindings()    # threadIdx.x, threadIdx.y
 
 ---
 
-## 十、调试
+## 八、调试
 
 ### `T.print` — 打印缓冲区内容
 
@@ -568,7 +543,7 @@ T.device_assert(cond, msg='index out of range')
 
 ---
 
-## 十一、编译 Pass 配置
+## 九、编译 Pass 配置
 
 ### `tl.PassConfigKey` — 编译 Pass 开关
 
@@ -588,40 +563,9 @@ T.device_assert(cond, msg='index out of range')
 
 ---
 
-## 十二、完整 GEMM 示例
+## 十、持久化 GEMM 完整示例
 
-### 12.1 基础 GEMM（每个 Block 处理一个 tile）
-
-```python
-import tilelang.language as T
-
-M, N, K = T.dynamic("M N K")
-block_M = 128
-block_N = 128
-block_K = 32
-threads = 128
-
-def Matmul(A: T.Buffer, B: T.Buffer, C: T.Buffer):
-    with T.Kernel(
-        T.ceildiv(N, block_N),   # grid_x
-        T.ceildiv(M, block_M),   # grid_y
-        threads=threads
-    ) as (bx, by):
-
-        A_shared = T.alloc_shared((block_M, block_K), dtype="float16")
-        B_shared = T.alloc_shared((block_K, block_N), dtype="float16")
-        C_local = T.alloc_fragment((block_M, block_N), dtype="float32")
-        T.clear(C_local)
-
-        for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
-            T.copy(A[by * block_M, k * block_K], A_shared)
-            T.copy(B[k * block_K, bx * block_N], B_shared)
-            T.gemm(A_shared, B_shared, C_local)
-
-        T.copy(C_local, C[by * block_M, bx * block_N])
-```
-
-### 12.2 持久化 GEMM（少量 Block 循环处理大量 tile，含 Swizzle 优化）
+下面是将前九章全部知识融会贯通的完整示例：持久化调度 + Swizzle 布局优化 + Fragment 中转数据流。
 
 ```python
 @tl.jit(out_idx=[-1], pass_configs={
