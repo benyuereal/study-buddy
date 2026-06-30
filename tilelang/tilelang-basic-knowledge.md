@@ -2,7 +2,90 @@
 
 ## 文档定位
 
-本文档是 TileLang 关键字的速查手册，逐个解释每个原语的语法、语义、与 GPU 硬件的对应关系，以及使用场景。阅读前请先理解 [GPU 基础概念](./gpu-basic-knowledge.md)（Grid、Block、Wave、Shared Memory/LDS、寄存器、Tiling 等）。本文档以海光 DCU 为主要目标硬件，LDS 默认 64 KB/CU，Wave 为 64 线程。
+本文档是 TileLang 关键字的**速查手册**，逐个解释每个原语的语法、语义、与 GPU 硬件的对应关系，以及使用场景。面向具备 GPU 基础知识的开发者（Expert 层级），提供线程级精确控制。
+
+阅读前请先理解 [GPU 基础概念](./gpu-basic-knowledge.md)（Grid、Block、Wave、Shared Memory/LDS、寄存器、Tiling 等）。本文档以海光 DCU 为主要目标硬件，LDS 默认 64 KB/CU，Wave 为 64 线程。
+
+---
+
+## 前言：TileLang 编程模型
+
+### 什么是 TileLang
+
+TileLang 是一个**面向 GPU/CPU 高性能计算的领域特定语言（DSL）**，以 Pythonic 语法提供显式的硬件内存管理、线程级并行控制和软件流水线能力。它构建于 TVM 之上，通过多层 IR 逐步降级到硬件特定的可执行代码。
+
+### 三层编程接口
+
+TileLang 提供三种不同抽象层级的编程接口，用户可在同一个 Kernel 中混合使用：
+
+| 层级 | 目标用户 | 特点 |
+|------|---------|------|
+| **Beginner** | 硬件无关开发者 | 无需关心内存层次，专注算法逻辑（尚未完全实现） |
+| **Developer** | 了解 GPU 内存层次的开发者 | 提供 Tile Library，用预定义算子组合 Kernel |
+| **Expert** | 深度理解硬件特性的专家 | 直接控制线程原语、内存布局、同步机制 |
+
+**本文档面向 Expert 层级**，覆盖所有底层原语和线程级控制。
+
+### 编译流水线
+
+```
+Python Tile Program
+       │
+       ▼
+  IRModule（TVM 中间表示）
+       │
+       ▼
+  源代码生成（C / CUDA / HIP / LLVM / Metal）
+       │
+       ▼
+  硬件可执行文件（NVIDIA / AMD / DCU / Ascend / Apple）
+```
+
+1. 用户用 Python 编写 Tile Program（包含 `@T.prim_func`、`T.Kernel` 等）
+2. TileLang 编译器将其降级为 TVM IRModule
+3. IR 经布局推断（Layout Inference）、流水线规划、向量化等 Pass 优化后，生成 target-specific 源代码
+4. 最终编译为对应 GPU 后端（CUDA/HIP/Metal/AscendC 等）的可执行文件
+
+**支持的后端**：NVIDIA（CUDA、NVRTC、CuTeDSL）、AMD（HIP/ROCm）、海光 DCU（HCU）、华为昇腾（AscendC、AscendNPU IR）、Apple Metal、WebGPU。
+
+### Tile 作为一等公民
+
+TileLang 的核心思想是将 **Tile（分块）** 作为一等公民。一个 Tile 表示数据中的一个形状化片段，由 warp 或 thread block 独立持有和操作。开发者显式指定：
+
+- **数据在哪里**：`T.alloc_shared`（LDS）、`T.alloc_fragment`（寄存器）、`T.alloc_local`（线程私有）
+- **数据怎么搬**：`T.copy`（同步）、`T.async_copy`（异步）
+- **怎么算**：`T.gemm`（矩阵乘）、逐元素运算、归约
+
+`T.alloc_fragment` 分配的不是单个线程的寄存器，而是**整个 Thread Block 的寄存器文件**中的一块。TileLang 的编译 Pass **Layout Inference** 自动推导每个线程持有 fragment 的哪个子矩阵，生成最优的数据分布。
+
+### 编程模型图示：多层分块 GEMM 全景
+
+下图完整展示了 TileLang 的分层分块 GEMM 编程模型，打通 **GPU 硬件分层存储** 与 **TileLang DSL 语法** 的映射关系：
+
+![TileLang 多层分块 GEMM 编程模型](assets/tilelang-gemm-model.png)
+
+**左半部分 (a) — 硬件原理**：
+
+- **存储金字塔**（绿色→红色→青蓝）：寄存器文件（最快、最小）→ Shared Memory/LDS（片上高速缓存）→ Global Memory（容量最大、延迟最高）
+- **蓝色弧形箭头**：数据流转路径 Global → Shared → Register，体现分层缓存分块
+- **两层网格**：下层 Global Memory 存储完整大矩阵（红色小块 = 当前 Block 待处理的 tile）；上层 Shared Memory 存放搬运来的 tile 副本，再拆分为更小块送入寄存器执行计算。核心语义：`C_tile += A_tile × B_tile`
+
+**右半部分 (b) — TileLang 代码映射**（从上到下，每段代码对应一层硬件操作）：
+
+| 代码块 | 对应硬件层级 | 关键原语 |
+|--------|------------|---------|
+| Kernel 启动配置 | Grid/Block 线程组织 | `T.Kernel(grid_x, grid_y, threads=128)` |
+| 内存缓冲区分配 | Shared Memory + 寄存器 | `T.alloc_shared`（红色图例）、`T.alloc_fragment`（绿色图例） |
+| 流水线主循环 | 加载与计算重叠 | `T.Pipelined(..., num_stages=3)` |
+| Global → Shared 数据搬运 | 图左蓝色弧形箭头 | `T.copy(A[..], A_shared)` |
+| GEMM 计算 | 寄存器级乘加 | `T.gemm(A_shared, B_shared, C_local)` |
+| 结果写回 Global Memory | 寄存器 → 全局显存 | `T.copy(C_local, C[...])` |
+
+这张图的核心价值：**一行 TileLang 原语对应一层硬件操作**，显式控制从全局显存到寄存器的完整数据流，是理解本文档所有原语设计动机的起点。
+
+### 与本文档的关系
+
+后续章节按照"定义 Kernel → 分配内存 → 搬运数据 → 计算 → 控制流 → 布局优化 → 同步 → 调试 → 编译配置"的顺序逐一展开，最后给出完整的 GEMM 示例和速查表。
 
 ---
 
@@ -53,31 +136,25 @@ def my_gemm(M, N, K, block_M, block_N, block_K, ...):
 
 **典型用法**：工厂函数里做 Python 级的计算（如 `T.ceildiv`、`T.min`），把结果作为常量传给 prim_func，prim_func 里只写纯 GPU 逻辑。
 
-### `T.min` — 取最小值
-
-```python
-grid_size = T.min(m_blocks * n_blocks, wgs_per_cu * cu_num)
-```
-
-`T.min` 在 JIT 工厂函数中计算两个值的最小值，结果作为常量传入 prim_func。这和 `T.ceildiv` 一样，是在**编译时**求值的 Python 级辅助函数，不是 GPU 指令。
-
 ---
 
-## 二、Kernel 定义与执行上下文
+## 二、Kernel 启动配置
 
 ### `T.Kernel` — 定义 GPU 启动配置
 
 ```python
-with T.Kernel(grid_size, threads=128) as (block_id):
+with T.Kernel(grid_x, grid_y, threads=128) as (bx, by):
 ```
 
-除了之前介绍的二维 Grid `T.Kernel(grid_x, grid_y, threads=...) as (bx, by)`，`T.Kernel` 还支持**一维 Grid**：
+`T.Kernel` 支持二维和一维 Grid：
 
-- `grid_size`：一维 Grid 的 Block 总数
+- **二维 Grid**：`T.Kernel(grid_x, grid_y, threads=...) as (bx, by)`，`bx`/`by` 分别对应 `blockIdx.x`/`blockIdx.y`
+- **一维 Grid**：`T.Kernel(grid_size, threads=...) as (block_id)`，常用于持久化 Kernel
 - `threads=128`：每个 Block 内的线程数，**DCU 上应为 64 的倍数，最大 1024**
-- `block_id`：当前 Block 在一维 Grid 中的索引（0 到 grid_size-1）
 
-一维 Grid 常用于**持久化 Kernel**（Persistent Kernel）——grid_size 远小于实际 tile 数量，每个 Block 循环处理多个 tile（见 `T.Persistent`）。
+---
+
+## 三、编译时工具函数
 
 ### `T.ceildiv` — 向上取整除
 
@@ -87,9 +164,25 @@ grid_x = T.ceildiv(N, block_N)  # 等价于 ceil(N / block_N)
 
 当矩阵尺寸不能被分块大小整除时，边缘 Block 需要处理"不足一块"的数据（通过边界 `if` 守卫）。
 
+### `T.min` — 取最小值
+
+```python
+grid_size = T.min(m_blocks * n_blocks, wgs_per_cu * cu_num)
+```
+
+`T.min` 生成 TIR 的 Min 表达式，既可出现在 JIT 工厂函数中做编译时常量计算，也可出现在 prim_func 内部生成对应的 GPU min 指令。典型用法是持久化 Kernel 中限制 Block 数量不超过 `wgs_per_cu × cu_num`。
+
+### `T.dynamic` — 定义符号变量
+
+```python
+M, N, K = T.dynamic("M N K")
+```
+
+在 lazy 模式（`@T.prim_func`）中声明编译时符号维度，工厂函数将其"冻结"为常量传入 prim_func。
+
 ---
 
-## 三、内存分配
+## 四、内存分配
 
 ### `T.alloc_shared` — 分配 Shared Memory 缓冲区
 
@@ -107,7 +200,7 @@ A_shared = T.alloc_shared((block_M, block_K), dtype="float16")
 ### `T.alloc_fragment` — 分配寄存器级缓冲区
 
 ```python
-C_local = T.alloc_fragment((block_M, block_N), accum_dtype="float32")
+C_local = T.alloc_fragment((block_M, block_N), dtype="float32")
 ```
 
 在寄存器文件上分配缓冲区，用于存储计算中间结果：
@@ -116,7 +209,16 @@ C_local = T.alloc_fragment((block_M, block_N), accum_dtype="float32")
 - TileLang 的 Layout Inference 会自动推导每个线程持有 fragment 的哪个子矩阵
 - 寄存器是最快的内存（~1 cycle 延迟），累加器应放在 fragment 中
 - 使用前必须用 `T.clear` 初始化为零
-- **fragment 也可用于存储输入数据**（如 A_local、B_local），当需要手动控制数据在 Shared Memory 和寄存器之间的流转时，把输入也放到 fragment 中
+- fragment 也可用于存储输入数据（如 `A_local`、`B_local`），当需要手动控制数据在 Shared Memory 和寄存器之间的流转时，把输入也放到 fragment 中
+
+### `T.alloc_local` — 分配线程私有标量/小数组
+
+```python
+scale = T.alloc_local([1], dtype="float32")
+lse_max = T.alloc_local([1], dtype="float32")
+```
+
+在线程私有内存（local memory）中分配标量或小数组。常用于存储中间标量值（scale、max、LSE 等），配合归约操作使用。注意：local memory 可能溢出到 Global Memory，频繁访问可能影响性能。
 
 ### `T.clear` / `T.fill` — 缓冲区初始化
 
@@ -125,9 +227,13 @@ T.clear(C_local)       # 所有元素置零
 T.fill(buf, value)     # 所有元素填充为 value
 ```
 
+`T.clear` 等价于 `T.fill(buf, 0)`。`T.fill` 支持任意填充值，常用于：
+- 累加器初始化为零（`T.clear`）
+- 最大/最小值初始化（`T.fill(buf, T.infinity("float32"))` 或 `T.fill(buf, -T.infinity("float32"))`）
+
 ---
 
-## 四、数据搬运
+## 五、数据搬运
 
 ### `T.copy` — 同步数据搬运
 
@@ -174,7 +280,7 @@ T.ptx_wait_group(N)         # 等待还剩 N 组未完成的异步拷贝
 
 ---
 
-## 五、计算
+## 六、计算
 
 ### `T.gemm` — 矩阵乘法原语
 
@@ -183,7 +289,8 @@ T.ptx_wait_group(N)         # 等待还剩 N 组未完成的异步拷贝
 T.gemm(A_shared, B_shared, C_local)
 
 # 进阶用法：Fragment 输入 + 参数控制
-T.gemm(A_local, B_local, C_local, k_pack=2, transpose_B=True)
+T.gemm(A_local, B_local, C_local, k_pack=2, transpose_B=True,
+       policy=T.GemmWarpPolicy.FullCol)
 ```
 
 在 Shared Memory 或 Fragment 上的两个输入矩阵做矩阵乘法，结果累加到 fragment 累加器（`C += A @ B`）：
@@ -208,17 +315,61 @@ T.gemm(A, B, C, transpose_B=True)
 
 当 B 矩阵的存储格式为 **N×K（列主序）** 而非 K×N（行主序）时，设置 `transpose_B=True` 告诉编译器 B 已经在逻辑上被转置了。这对应 DCU 上 B 矩阵通常按 N×K 存储的惯例，避免手动转置的开销。
 
-### 其他常用计算原语
+#### `T.GemmWarpPolicy` — GEMM Warp 分区策略
+
+```python
+T.gemm(A, B, C, policy=T.GemmWarpPolicy.FullCol)
+```
+
+控制 `T.gemm` 内部 Warp 在 M、N 维度上的分区方式，影响计算吞吐和寄存器压力：
+
+| 策略 | 含义 | 适用场景 |
+|------|------|---------|
+| `Square`（默认） | 在 M 和 N 之间平衡分配 warp | 通用场景，方阵或接近方阵 |
+| `FullRow` | 所有 warp 沿 M 方向排列 | M 远大于 N |
+| `FullCol` | 所有 warp 沿 N 方向排列 | N 远大于 M（如 attention 中 N 较小） |
+| `FullColK` | 所有 warp 沿 N 和 K 方向排列 | 需更细粒度的 K 并行 |
+
+策略选择直接影响每个 warp 处理的 tile 形状和寄存器使用量，应根据矩阵形状和 block tile 大小来调整。
+
+### 逐元素数学运算
+
+以下原语可在 prim_func 内直接使用，对应 GPU 的逐元素运算指令：
+
+| 原语 | 用途 | 典型场景 |
+|------|------|---------|
+| `T.max(a, b)` | 取两数最大值 | ReLU、attention score 裁剪 |
+| `T.exp(x)` / `T.exp2(x)` | 指数 / 2 的指数 | softmax、attention |
+| `T.log(x)` / `T.log2(x)` | 自然对数 / 以 2 为底对数 | 交叉熵、log-softmax |
+| `T.rsqrt(x)` | 倒数平方根 | LayerNorm、RMSNorm |
+| `T.sigmoid(x)` | Sigmoid 激活 | 门控机制 |
+| `T.cast(x, dtype)` | 类型转换 | 精度切换（如 fp16 → fp32） |
+| `T.infinity(dtype)` | 该类型的无穷大值 | 归约初始化（`T.fill(buf, -T.infinity("float32"))`） |
+| `T.clamp(x, lo, hi)` | 限制在 [lo, hi] 范围 | 数值稳定性 |
+| `T.dp4a(A, B, C)` | 4 元素点积累加 | INT8 量化计算 |
+
+### 条件选择
+
+```python
+result = T.if_then_else(cond, true_val, false_val)
+```
+
+三元条件表达式，等价于 `cond ? true_val : false_val`。常用于边界检查（`indices_local >= 0`）和带 mask 的赋值。注意：这不是控制流分支，而是 IR 表达式，确保所有线程执行同一指令。
+
+### 归约操作
 
 | 原语 | 用途 |
 |------|------|
-| `T.gemm_sp(...)` | 2:4 稀疏矩阵乘法 |
-| `T.reduce_sum/max/min(buf, axis)` | 归约操作 |
-| `T.exp/log/rsqrt/sigmoid(x)` | 逐元素数学运算 |
+| `T.reduce_sum(buf, axis)` | 沿指定轴求和 |
+| `T.reduce_max(buf, axis)` | 沿指定轴取最大值 |
+| `T.reduce_min(buf, axis)` | 沿指定轴取最小值 |
+| `T.reduce_sum_warp(...)` | Warp 内求和归约 |
+
+归约操作的累加器需要用 `T.clear` 或 `T.fill` 初始化，结果通常写入 `T.alloc_local` 分配的缓冲区中。
 
 ---
 
-## 六、控制流
+## 七、控制流
 
 ### 控制流选择总览
 
@@ -304,7 +455,7 @@ T.Pipelined(num_stages=3):
 - **代价**：LDS 占用 = `num_stages × (A_shared + B_shared)`
 - **调优**：在 LDS 容量允许的前提下，增加 `num_stages` 可以更好地隐藏访存延迟
 
-### `T.Persistent` — 持久化 Block 调度（新增）
+### `T.Persistent` — 持久化 Block 调度
 
 ```python
 for bx, by in T.Persistent(
@@ -313,7 +464,6 @@ for bx, by in T.Persistent(
     block_id,                                          # 当前 Block 的一维 ID
     group_size=1                                       # tile 分组大小
 ):
-    # bx: N 方向 tile 坐标, by: M 方向 tile 坐标
     ...
 ```
 
@@ -321,11 +471,7 @@ for bx, by in T.Persistent(
 
 > **当 Grid 中的 Block 数量少于实际 tile 数量时，让每个 Block 自动轮询处理多个 tile。**
 
-**为什么需要持久化 Kernel**：
-
-普通 GEMM 中 Grid 的 Block 数量 = `m_blocks × n_blocks`，有多少个 tile 就启动多少个 Block。当矩阵很大时，Block 数量可能达到数万个，GPU 硬件调度器需要大量时间创建、分配、回收 Block。
-
-持久化 Kernel 的做法是：**只启动少量 Block（等于 CU 数量 × wgs_per_cu），每个 Block 循环处理多个 tile**。Block 通过 `T.Persistent` 自动获取下一个要处理的 tile 坐标 `(bx, by)`，处理完后继续获取下一个，直到所有 tile 处理完毕。
+持久化 Kernel 只启动少量 Block（等于 CU 数量 × wgs_per_cu），每个 Block 通过 `T.Persistent` 自动获取下一个要处理的 tile 坐标 `(bx, by)`，处理完后继续获取下一个，直到所有 tile 处理完毕。相比普通 GEMM（有多少 tile 就启动多少 Block），减少了 GPU 硬件调度器的 Block 创建/分配/回收开销。
 
 **参数说明**：
 
@@ -334,26 +480,9 @@ for bx, by in T.Persistent(
 - 第三个参数 `block_id`：当前 Block 在一维 Grid 中的 ID（来自 `T.Kernel(grid_size, ...) as (block_id)`）
 - `group_size`：tile 分组大小，控制相邻 tile 是否合并处理。`group_size=1` 表示每个 Block 每次只拿一个 tile
 
-**与手动 waves 循环的对比**：
-
-```python
-# 手动 waves 方式（需要自己算 tile_id、坐标映射）
-for w in T.serial(waves):
-    tile_id = grid_size * w + block_id
-    bx = (tile_id // group_size) % m_blocks
-    by = (tile_id % group_size) + (tile_id // group_size) // m_blocks * group_size
-    ...
-
-# T.Persistent 方式（编译器自动处理调度逻辑）
-for bx, by in T.Persistent([n_blocks, m_blocks], grid_size, block_id, group_size=1):
-    ...
-```
-
-`T.Persistent` 让编译器自动生成最优的 tile 分配逻辑，避免了手动计算坐标的复杂性，并且可以利用硬件提供的 persistent 调度优化。
-
 ---
 
-## 七、布局注解（Layout Annotation）
+## 八、布局注解（Layout Annotation）
 
 ### `T.annotate_layout` — 声明缓冲区的内存布局
 
@@ -392,7 +521,58 @@ tl.layout.make_hcu_swizzled_layout(buffer, major_pack=2)
 
 ---
 
-## 八、编译 Pass 配置
+## 九、同步与线程索引
+
+### 同步原语
+
+```python
+T.sync_threads()   # Block 内所有线程同步（__syncthreads）
+T.sync_warp()      # Wave 内线程同步（__syncwarp，DCU 上 64 线程）
+```
+
+Shared Memory 写入后、读取前通常需要同步。但 TileLang 的 `T.copy` 和 `T.gemm` 在大多数场景下已自动插入必要的同步。**当手动做 Fragment ↔ Shared 的数据流转时**，需要显式插入同步：
+
+```python
+T.copy(C_local_0, C_shared_0)
+T.sync_threads()                                 # 确保所有线程写入完成
+T.copy(C_shared_0, C[by * block_M, bx * block_N])
+T.sync_threads()                                 # 确保 C_shared_0 可以被下一轮复用
+T.copy(C_local_1, C_shared_0)
+```
+
+### 线程索引
+
+```python
+tx = T.get_thread_binding()         # 当前线程的 threadIdx.x
+tx, ty = T.get_thread_bindings()    # threadIdx.x, threadIdx.y
+```
+
+获取当前线程在 Block 内的索引，用于手动控制线程级数据分配（如 sparse attention 中的 gather/scatter 操作）。大多数情况下 Layout Inference 会自动分配，不需要手动获取。
+
+---
+
+## 十、调试
+
+### `T.print` — 打印缓冲区内容
+
+```python
+T.print(C_f, msg='accumulator:')
+T.print(A_s, msg='A tile:')
+```
+
+从单个线程打印缓冲区或标量的内容，避免多线程输出洪水。用于快速验证中间结果。
+
+### `T.device_assert` — 设备端断言
+
+```python
+T.device_assert(cond, msg='index out of range')
+```
+
+在 GPU 上执行条件检查，条件为假时触发断言。用于调试边界条件或数值异常。
+
+---
+
+## 十一、编译 Pass 配置
 
 ### `tl.PassConfigKey` — 编译 Pass 开关
 
@@ -412,33 +592,14 @@ tl.layout.make_hcu_swizzled_layout(buffer, major_pack=2)
 
 ---
 
-## 九、同步
+## 十二、完整 GEMM 示例
 
-```python
-T.sync_threads()   # Block 内所有线程同步
-T.sync_warp()      # Wave 内线程同步（DCU 上 64 线程）
-```
-
-Shared Memory 写入后、读取前通常需要同步。但 TileLang 的 `T.copy` 和 `T.gemm` 在大多数场景下已自动插入必要的同步。**当手动做 Fragment ↔ Shared 的数据流转时**，需要显式插入同步：
-
-```python
-T.copy(C_local_0, C_shared_0)
-T.sync_threads()                                 # 确保所有线程写入完成
-T.copy(C_shared_0, C[by * block_M, bx * block_N])
-T.sync_threads()                                 # 确保 C_shared_0 可以被下一轮复用
-T.copy(C_local_1, C_shared_0)
-```
-
----
-
-## 十、完整 GEMM 示例
-
-### 10.1 基础 GEMM（每个 Block 处理一个 tile）
+### 12.1 基础 GEMM（每个 Block 处理一个 tile）
 
 ```python
 import tilelang.language as T
 
-M, N, K = T.define_symbol("M N K")
+M, N, K = T.dynamic("M N K")
 block_M = 128
 block_N = 128
 block_K = 32
@@ -451,9 +612,9 @@ def Matmul(A: T.Buffer, B: T.Buffer, C: T.Buffer):
         threads=threads
     ) as (bx, by):
 
-        A_shared = T.alloc_shared((block_M, block_K))
-        B_shared = T.alloc_shared((block_K, block_N))
-        C_local = T.alloc_fragment((block_M, block_N), accum_dtype=T.float32)
+        A_shared = T.alloc_shared((block_M, block_K), dtype="float16")
+        B_shared = T.alloc_shared((block_K, block_N), dtype="float16")
+        C_local = T.alloc_fragment((block_M, block_N), dtype="float32")
         T.clear(C_local)
 
         for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
@@ -464,7 +625,7 @@ def Matmul(A: T.Buffer, B: T.Buffer, C: T.Buffer):
         T.copy(C_local, C[by * block_M, bx * block_N])
 ```
 
-### 10.2 持久化 GEMM（少量 Block 循环处理大量 tile，含 Swizzle 优化）
+### 12.2 持久化 GEMM（少量 Block 循环处理大量 tile，含 Swizzle 优化）
 
 ```python
 @tl.jit(out_idx=[-1], pass_configs={
@@ -501,8 +662,8 @@ def gemm_persistent(M, N, K, block_M, block_N, block_K,
             B_local_1_ = T.alloc_fragment((sub_block_N, block_K), dtype)
 
             # Fragment 分配：输出累加器（split_n 份，各算一半 N）
-            C_local_0 = T.alloc_fragment((block_M, sub_block_N), accum_dtype)
-            C_local_1 = T.alloc_fragment((block_M, sub_block_N), accum_dtype)
+            C_local_0 = T.alloc_fragment((block_M, sub_block_N), dtype="float32")
+            C_local_1 = T.alloc_fragment((block_M, sub_block_N), dtype="float32")
 
             # Shared Memory 分配：输出中转缓冲区
             C_shared_0 = T.alloc_shared((block_M, sub_block_N), dtype)
@@ -572,7 +733,7 @@ def gemm_persistent(M, N, K, block_M, block_N, block_K,
 |------|------|
 | `@T.prim_func` | 定义 TileLang IR 函数 |
 | `@tl.jit(out_idx, pass_configs)` | JIT 编译包装器 |
-| `T.min(a, b)` | 编译时取最小值（工厂函数中用） |
+| `T.dynamic(name)` | 定义编译时符号变量 |
 | `T.ceildiv(a, b)` | 编译时向上取整除 |
 
 ### 内存与搬运
@@ -580,11 +741,27 @@ def gemm_persistent(M, N, K, block_M, block_N, block_K,
 |------|------|
 | `T.alloc_shared(shape, dtype)` | 分配 Shared Memory 缓冲区 |
 | `T.alloc_fragment(shape, dtype)` | 分配寄存器级缓冲区 |
+| `T.alloc_local(shape, dtype)` | 分配线程私有标量/小数组 |
 | `T.copy(src, dst, coalesced_width=...)` | 同步数据搬运，支持任意内存层级 |
 | `T.async_copy(src, dst)` | 显式异步搬运（需手动等待） |
 | `T.clear(buf)` / `T.fill(buf, val)` | 缓冲区清零/填充 |
 | `T.annotate_layout({buf: layout})` | 声明缓冲区内存布局 |
 | `tl.layout.make_hcu_swizzled_layout(buf, major_pack=N)` | DCU Swizzle 布局生成 |
+
+### 计算
+| 原语 | 用途 |
+|------|------|
+| `T.gemm(A, B, C, k_pack=N, transpose_B=True, policy=...)` | 矩阵乘法 |
+| `T.GemmWarpPolicy.Square/FullRow/FullCol/FullColK` | GEMM Warp 分区策略 |
+| `T.reduce_sum/max/min(buf)` | 归约操作 |
+| `T.reduce_sum_warp(...)` | Warp 内求和归约 |
+| `T.max(a, b)` / `T.exp/log/exp2/log2(x)` | 逐元素数学运算 |
+| `T.rsqrt(x)` / `T.sigmoid(x)` | 逐元素数学运算 |
+| `T.cast(x, dtype)` | 类型转换 |
+| `T.infinity(dtype)` | 该类型的无穷大值 |
+| `T.clamp(x, lo, hi)` | 限制在 [lo, hi] 范围 |
+| `T.dp4a(A, B, C)` | 4 元素点积累加 |
+| `T.if_then_else(cond, t, f)` | 条件选择表达式 |
 
 ### 控制流
 | 原语 | 执行模式 | 使用场景 |
@@ -595,18 +772,18 @@ def gemm_persistent(M, N, K, block_M, block_N, block_K,
 | `T.Pipelined(n, num_stages)` | 串行+预取重叠 | 加载与计算重叠，隐藏访存延迟 |
 | `T.Persistent(dims, grid, id, group_size)` | 持久化 Block 调度 | Block 数 < tile 数，Block 轮询处理 tile |
 
-### 计算
-| 原语 | 用途 |
-|------|------|
-| `T.gemm(A, B, C, k_pack=N, transpose_B=True)` | 矩阵乘法，支持 fragment 输入和参数控制 |
-| `T.reduce_sum/max/min(buf)` | 归约操作 |
-| `T.exp/log/rsqrt/sigmoid(x)` | 逐元素数学运算 |
-
-### 同步
+### 同步与线程索引
 | 原语 | 用途 |
 |------|------|
 | `T.sync_threads()` | Block 内全同步 |
 | `T.sync_warp()` | Wave 内同步（DCU: 64 线程） |
+| `T.get_thread_binding(dim)` | 获取当前线程索引（threadIdx） |
+
+### 调试
+| 原语 | 用途 |
+|------|------|
+| `T.print(buf, msg='...')` | 打印缓冲区/标量（单线程） |
+| `T.device_assert(cond, msg='...')` | 设备端断言 |
 
 ### 编译配置
 | 配置键 | 作用 |
