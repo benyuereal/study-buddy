@@ -91,12 +91,12 @@ TileLang 的核心思想是将 **Tile（分块）** 作为一等公民。一个 
 
 | 类别 | 原语 | 作用 |
 |------|------|------|
-| 函数装饰器 | `@T.prim_func` | 将 Python 函数标记为 TileLang IR 函数，参数用 `T.Tensor(shape, dtype)` 标注。返回 IR 对象，不直接执行。 |
-| 函数装饰器 | `@tl.jit` | JIT 编译包装器。将返回 `prim_func` 的 Python 工厂函数编译为可调用的 GPU kernel。`out_idx` 指定输出参数索引（如 `[-1]` 表示最后一个参数是输出），`pass_configs` 传递编译选项。 |
-| Kernel 启动 | `T.Kernel(*blocks, threads=128)` | 定义 GPU 的 Grid/Block 组织。`*blocks` 为 Grid 各维度（1~3 个）；`threads` 为每 Block 线程数，支持 `int` 或 `tuple`。DCU 上应为 64 的倍数，最大 1024。`as (bx, by)` 绑定 `blockIdx`。 |
-| 编译时工具 | `T.dynamic("M N K")` | 声明编译时符号变量，空格/逗号分隔多变量。 |
-| 编译时工具 | `T.ceildiv(a, b)` | 编译时向上取整除，等价于 `(a + b - 1) // b`。也写作 `T.cdiv`。 |
-| 编译时工具 | `T.min(a, b)` | 编译时取两表达式的最小值，生成 Min 节点而非运行时分支。 |
+| 函数装饰器 | `@T.prim_func` | 标记为 TileLang IR 函数，参数用 `T.Tensor(shape, dtype)` 标注 |
+| 函数装饰器 | `@tl.jit` | JIT 编译包装器，将工厂函数编译为可调用的 GPU kernel |
+| Kernel 启动 | `T.Kernel(*blocks, threads=128)` | 定义 Grid/Block 组织，`as (bx, by)` 绑定 blockIdx |
+| 编译时工具 | `T.dynamic("M N K")` | 声明编译时符号变量 |
+| 编译时工具 | `T.ceildiv(a, b)` | 编译时向上取整除，也写作 `T.cdiv` |
+| 编译时工具 | `T.min(a, b)` | 编译时取最小值，生成 Min 节点而非运行时分支 |
 
 三者均在编译时求值，"冻结"为常量传入 `prim_func`。
 
@@ -137,10 +137,6 @@ N=1048576, max_diff=0.000000, passed.
 
 ### `T.alloc_shared` — 分配 Shared Memory 缓冲区
 
-```python
-T.alloc_shared(shape: tuple[int, int], dtype: str, scope: str = "shared.dyn") → Buffer
-```
-
 在 GPU 的 LDS（Local Data Share）上分配二维缓冲区。
 
 ```python
@@ -169,34 +165,25 @@ DCU 单 CU 的 LDS 上限为 64 KB，48 KB 已占用 75%，留给其他缓冲区
 
 ### `T.alloc_fragment` — 分配寄存器级缓冲区
 
-```python
-T.alloc_fragment(shape: tuple[int, int], dtype: str, scope: str = "local.fragment") → Buffer
-```
-
-在寄存器文件上分配缓冲区，用于存储 GEMM 累加器或输入数据。
+在寄存器文件上分配缓冲区。根据用途分为两种：
 
 ```python
-C_f = T.alloc_fragment((BM, BN), "float32")
+C_f     = T.alloc_fragment((BM, BN), "float32")   # GEMM 累加器
+A_local = T.alloc_fragment((BM, BK), "float16")   # 输入数据缓存
 ```
 
 **硬件对应**：寄存器文件（Register File），GPU 存储层级中最快的一级（~1 cycle 延迟）。`alloc_fragment` 分配的不是单个线程的寄存器，而是**整个 Thread Block 的寄存器文件**中的一块——TileLang 的 Layout Inference 会自动推导每个线程持有 fragment 的哪个子矩阵。
 
-**为什么累加器用 float32**：`T.gemm` 做的是 `C += A × B`（累加），即使输入 A、B 是 float16，累加器也应用 float32，避免多次累加后精度丢失。
+**为什么 GEMM 累加器用 float32**：`T.gemm` 做的是 `C += A × B`（累加），即使输入 A、B 是 float16，累加器也应用 float32，避免多次累加后精度丢失。
 
-**为什么必须 `T.clear`**：寄存器分配后内容是未定义的（硬件不会自动清零）。由于 `T.gemm` 是累加操作（`C += A×B`），不清零会导致有效结果 += 垃圾值 = 垃圾。因此：
+**累加器必须 `T.clear`**：寄存器分配后内容是未定义的（硬件不会自动清零）。`T.gemm` 是累加操作（`C += A×B`），不清零会导致有效结果 += 垃圾值 = 垃圾。输入数据缓存（如 `A_local`）不需要 clear——`T.copy` 会覆写整个缓冲区。
 
 ```python
 C_f = T.alloc_fragment((BM, BN), "float32")
-T.clear(C_f)   # 必须——不清零，结果不可预测
+T.clear(C_f)     # 累加器必须清零
 ```
-
-fragment 也可用于存储输入数据（如 `A_local`、`B_local`），在需要手动控制数据路径（Global → Fragment → Shared → Fragment）的场景中使用。
 
 ### `T.alloc_local` — 分配线程私有标量
-
-```python
-T.alloc_local(shape: list[int], dtype: str, scope: str = "local") → Buffer
-```
 
 在线程私有内存中分配标量或小数组。
 
@@ -229,19 +216,7 @@ T.fill(buf, value)     # 所有元素填充为指定值
 
 ### `T.copy` — 同步数据搬运
 
-```python
-T.copy(
-    src: Buffer | BufferLoad | BufferRegion,
-    dst: Buffer | BufferLoad | BufferRegion,
-    *,
-    coalesced_width: int | None = None,
-    disable_tma: bool = False,
-    eviction_policy: Literal["evict_normal", "evict_first", "evict_last"] | None = None,
-    loop_layout: Any | None = None,
-)
-```
-
-`T.copy` 是 TileLang 中**统一的数据搬运原语**，支持任意内存层级之间的传输。语义上是同步的：调用后 `dst` 中的数据保证可用。
+`T.copy(src, dst)` 是 TileLang 中统一的数据搬运原语，支持任意内存层级之间的传输。语义上是同步的：调用后 `dst` 中的数据保证可用。
 
 编译器会根据源/目标类型和目标架构自动选择最优底层指令（SIMT copy、ldmatrix、cp.async、TMA 等），并自动做 coalesce 保证 Global Memory 合并访问。
 
@@ -257,29 +232,17 @@ T.copy(
 
 **`eviction_policy` 参数**：控制 L2 cache 的驱逐策略。`"evict_first"` 优先驱逐、`"evict_last"` 优先保留、`"evict_normal"` 正常策略。适合需要精细控制 cache 驻留的场景。
 
-**`disable_tma` 参数**：禁用 TMA（Tensor Memory Access）加速，即使在支持 TMA 的架构上也不走 TMA 路径。
-
-**`loop_layout` 参数**：为 SIMT copy 循环提供并行布局提示，帮助编译器优化向量化。
+常用参数：`coalesced_width` 指定 Global Memory 合并访存宽度，`eviction_policy` 控制 L2 cache 驱逐策略。
 
 ### `T.async_copy` — 显式异步搬运（进阶）
 
-```python
-T.async_copy(
-    src: Buffer | BufferLoad | BufferRegion,
-    dst: Buffer | BufferLoad | BufferRegion,
-    *,
-    coalesced_width: int | None = None,
-    loop_layout: Any | None = None,
-)
-```
+`T.async_copy(src, dst)` 发起异步 Global → Shared 拷贝（`cp.async` 指令），**不自动等待**，需手动调用 `T.ptx_wait_group` 同步。
 
-发起异步 Global → Shared 拷贝（通过 `cp.async` 指令），**不会自动等待完成**。必须手动调用 `T.ptx_wait_group` 来同步。
-
-与 `T.copy` 的关键区别：`T.copy` 自动插入 `commit` + `wait` 保证同步语义；`T.async_copy` 只发出 `cp.async` + `commit_group`，不插入 `wait`。
+与 `T.copy` 的关键区别：`T.copy` 自动插入 `commit` + `wait`；`T.async_copy` 只发出 `cp.async` + `commit_group`，不插入 `wait`。
 
 ```python
 T.async_copy(A[by * BM, ko * BK], A_s)   # 发起异步拷贝，不等待
-# ⋯ 做其他与 A_s 无关的计算 ⋯
+# … 做其他与 A_s 无关的计算 …
 T.ptx_wait_group(0)                        # 等待所有异步拷贝完成
 T.gemm(A_s, B_s, C_f)                      # 现在 A_s 中的数据保证可用
 ```
@@ -288,11 +251,7 @@ T.gemm(A_s, B_s, C_f)                      # 现在 A_s 中的数据保证可用
 
 ### `T.transpose` — Shared Memory 转置
 
-```python
-T.transpose(src: Buffer, dst: Buffer)
-```
-
-将 Shared Memory 中的 2D 缓冲区原地逻辑转置：`dst[j, i] = src[i, j]`。两个缓冲区必须都在 Shared Memory 且至少 2 维。
+`T.transpose(src, dst)` 将 Shared Memory 中的 2D 缓冲区原地逻辑转置：`dst[j, i] = src[i, j]`。两个缓冲区必须都在 Shared Memory 且至少 2 维。
 
 ---
 
@@ -300,22 +259,7 @@ T.transpose(src: Buffer, dst: Buffer)
 
 ### `T.gemm` — 矩阵乘法原语
 
-```python
-T.gemm(
-    A: Buffer,
-    B: Buffer,
-    C: Buffer,
-    transpose_A: bool = False,
-    transpose_B: bool = False,
-    policy: GemmWarpPolicy = GemmWarpPolicy.Square,
-    clear_accum: bool = False,
-    k_pack: int = 1,
-    mbar: BarrierType | None = None,
-    use_tf32: bool = False,
-)
-```
-
-在 Shared Memory 或 Fragment 上的两个输入矩阵做矩阵乘法，结果累加到 Fragment 累加器：`C += A @ B`。
+`T.gemm(A, B, C)` 在 Shared Memory 或 Fragment 上的两个输入矩阵做矩阵乘法，结果累加到 Fragment 累加器：`C += A @ B`。
 
 - **A、B**：输入矩阵，可位于 Shared Memory（`T.alloc_shared`）或 Fragment（`T.alloc_fragment`）
 - **C**：累加器，**必须**位于 Fragment（`T.alloc_fragment`），**必须**先 `T.clear`（见第二章）
@@ -330,22 +274,12 @@ T.gemm(A_local, B_local, C_f, k_pack=2, transpose_B=True,
        policy=T.GemmWarpPolicy.FullCol)
 ```
 
-**`transpose_A` / `transpose_B`**：当输入矩阵的存储格式与计算格式不一致时使用。例如 DCU 上 B 矩阵通常按 N×K（列主序）存储，设置 `transpose_B=True` 告诉编译器 B 已经在逻辑上被转置了，避免手动转置。
+常用参数：
 
-**`k_pack`**：K 维度打包因子。`k_pack=2` 表示每次迭代处理 K 维度的 2 个元素，利用向量化指令一次完成多个乘加。值需与数据类型和目标架构匹配。
-
-**`policy: GemmWarpPolicy`**：控制 `T.gemm` 内部 Warp 在 M、N 维度上的分区方式，直接影响每个 warp 处理的 tile 形状和寄存器压力：
-
-| 策略 | 含义 | 适用场景 |
-|------|------|---------|
-| `Square`（默认） | M 和 N 之间平衡分配 warp | 通用场景，方阵或接近方阵 |
-| `FullRow` | 所有 warp 沿 M 方向排列 | M 远大于 N |
-| `FullCol` | 所有 warp 沿 N 方向排列 | N 远大于 M（如 attention 中 N 较小） |
-| `FullColK` | 所有 warp 沿 N 和 K 方向排列 | 需更细粒度的 K 并行 |
-
-**`clear_accum`**：如果设为 `True`，编译器会在 GEMM 前自动清零累加器，可以省略手动的 `T.clear(C_f)`。
-
-**`use_tf32`**：在 HCU 目标上启用 TF32 矩阵指令，牺牲少量精度换取更高吞吐。
+- **`transpose_A` / `transpose_B`**：输入矩阵的存储格式与计算格式不一致时使用。例如 DCU 上 B 按 N×K 存储，`transpose_B=True` 告诉编译器隐式转置。
+- **`k_pack`**：K 维度打包因子，利用向量化指令一次完成多个乘加。RDNA 用 1，CDNA 可用 2。
+- **`policy`**：Warp 在 M、N 维度上的分区方式——`Square`（默认，方阵通用）、`FullRow`（M 远大于 N）、`FullCol`（N 远大于 M）、`FullColK`（细粒度 K 并行）。
+- **`clear_accum`**：`True` 时编译器自动清零累加器，可省略手动 `T.clear`。
 
 ### 逐元素数学运算
 
@@ -365,30 +299,15 @@ T.gemm(A_local, B_local, C_f, k_pack=2, transpose_B=True,
 
 ### `T.if_then_else` — 条件选择
 
-```python
-T.if_then_else(cond: PrimExpr, true_val: PrimExpr, false_val: PrimExpr) → PrimExpr
-```
-
 三元条件表达式，等价于 `cond ? true_val : false_val`。**不是控制流分支**，而是 IR 表达式，确保所有线程执行同一指令。
 
 ```python
-# 边界检查：越界时写 0
 C[gi] = T.if_then_else(gi < N, A[gi] + B[gi], 0.0)
 ```
 
 ### 归约操作
 
-```python
-T.reduce_sum(buffer: Buffer, out: Buffer, dim: int = -1, clear: bool = True)
-T.reduce_max(buffer: Buffer, out: Buffer, dim: int = -1, clear: bool = True, nan_propagate: bool = False)
-T.reduce_min(buffer: Buffer, out: Buffer, dim: int = -1, clear: bool = True, nan_propagate: bool = False)
-```
-
-- **`buffer`**：输入缓冲区
-- **`out`**：输出缓冲区（通常用 `T.alloc_local` 分配）
-- **`dim`**：归约维度，`-1` 表示归约所有维度
-- **`clear`**：`True` 时自动将 `out` 初始化为单位元（sum→0, max→-inf, min→+inf）
-- **`nan_propagate`**（max/min 专用）：float16/bfloat16 下控制 NaN 传播行为
+`T.reduce_sum/max/min(buffer, out, dim=-1, clear=True)` 沿指定维度归约。`dim=-1` 表示归约所有维度。`clear=True` 自动将 `out` 初始化为单位元（sum→0, max→-inf, min→+inf）。`out` 通常用 `T.alloc_local` 分配。
 
 ```python
 buf = T.alloc_fragment((BM, BN), "float32")
@@ -396,17 +315,6 @@ out = T.alloc_local([1], "float32")
 T.reduce_sum(buf, out, dim=-1)       # 归约所有元素求和，结果在 out[0]
 T.reduce_max(buf, out, dim=0)        # 沿 dim=0 取最大值
 ```
-
-### `T.reshape` / `T.view` — 形状/类型重解释
-
-```python
-T.reshape(src: Buffer, shape: tuple[int, ...]) → Buffer
-T.view(src: Buffer, shape: tuple[int, ...] | None = None, dtype: DType | None = None) → Buffer
-```
-
-两个原语都创建共享底层存储的新 Buffer 视图，不产生数据拷贝。`reshape` 只改形状（总比特数不变）；`view` 可以同时改形状和数据类型。
-
-
 
 ### 第二~四章总结：基础 GEMM
 
@@ -588,11 +496,7 @@ T.annotate_layout({
 
 ### `tl.layout.make_hcu_swizzled_layout` — DCU Swizzle 布局
 
-```python
-tl.layout.make_hcu_swizzled_layout(buffer, major_pack=2)
-```
-
-为 DCU 的 Shared Memory 缓冲区生成 swizzle 地址变换，返回一个 Layout 对象传给 `T.annotate_layout`。`major_pack` 控制向量化宽度。
+为 DCU 的 Shared Memory 缓冲区生成 swizzle 地址变换，返回 Layout 对象传给 `T.annotate_layout`。`major_pack` 控制向量化宽度，通常取 2。
 
 ---
 
@@ -791,6 +695,7 @@ def gemm_persistent(M, N, K, block_M, block_N, block_K,
 | `T.clear(buf)` / `T.fill(buf, val)` | 缓冲区清零/填充 |
 | `T.annotate_layout({buf: layout})` | 声明缓冲区内存布局 |
 | `tl.layout.make_hcu_swizzled_layout(buf, major_pack=N)` | DCU Swizzle 布局生成 |
+| `T.reshape(src, shape)` / `T.view(src, shape, dtype)` | 形状/类型重解释，零拷贝 |
 
 ### 计算
 | 原语 | 用途 |

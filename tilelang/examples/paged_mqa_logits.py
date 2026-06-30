@@ -84,7 +84,7 @@ def _pick_block_config(heads: int, index_dim: int):
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
-def paged_mqa_logits_tl(
+def paged_mqa_logits_kernel(
     heads: int,
     index_dim: int,
     block_N: int = 64,
@@ -283,7 +283,7 @@ def run_tilelang(
         print(f"  [tilelang config] H={heads}, D={index_dim}, "
               f"block_N={block_N}, num_stages={num_stages}, policy={policy_str}, "
               f"LDS={lds_bytes / 1024:.1f}KB / {LDS_LIMIT / 1024:.0f}KB")
-        _kernel_cache[cache_key] = paged_mqa_logits_tl(
+        _kernel_cache[cache_key] = paged_mqa_logits_kernel(
             heads=heads, index_dim=index_dim,
             block_N=block_N, num_stages=num_stages,
             policy=policy_str,
