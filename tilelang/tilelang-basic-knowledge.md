@@ -87,18 +87,7 @@ TileLang 的核心思想是将 **Tile（分块）** 作为一等公民。一个 
 
 ## 一、基础骨架
 
-以下三类原语是每个 TileLang kernel 的骨架：装饰器定义函数，Kernel 配置启动参数，工具函数在编译时求值。
-
-| 类别 | 原语 | 作用 |
-|------|------|------|
-| 函数装饰器 | `@T.prim_func` | 标记为 TileLang IR 函数，参数用 `T.Tensor(shape, dtype)` 标注 |
-| 函数装饰器 | `@tl.jit` | JIT 编译包装器，将工厂函数编译为可调用的 GPU kernel |
-| Kernel 启动 | `T.Kernel(*blocks, threads=128)` | 定义 Grid/Block 组织，`as (bx, by)` 绑定 blockIdx |
-| 编译时工具 | `T.dynamic("M N K")` | 声明编译时符号变量 |
-| 编译时工具 | `T.ceildiv(a, b)` | 编译时向上取整除，也写作 `T.cdiv` |
-| 编译时工具 | `T.min(a, b)` | 编译时取最小值，生成 Min 节点而非运行时分支 |
-
-三者均在编译时求值，"冻结"为常量传入 `prim_func`。
+每个 kernel 由三类原语组成：装饰器定义函数、`T.Kernel` 配置启动参数、`T.ceildiv`/`T.dynamic` 等编译时工具求值传入 `prim_func`。下面是一个完整的向量加法示例：
 
 下面是一个完整的向量加法示例，把三者串起来：
 
@@ -146,22 +135,7 @@ B_shared = T.alloc_shared((BK, BN), "float16")
 
 **硬件对应**：LDS / Shared Memory，片上 SRAM，当前 Block 独占。生命周期为 Block 执行期间，Block 内所有线程共享，其他 Block 不可访问。
 
-**容量公式**：单 Buffer 的 LDS 占用 = `shape[0] × shape[1] × sizeof(dtype)` 字节。当配合 `T.Pipelined` 的 `num_stages` 做多缓冲时，总占用为：
-
-```
-LDS 总占用 = num_stages × (BM×BK + BK×BN) × sizeof(dtype)
-```
-
-以基础 GEMM 为例（`BM=128, BN=128, BK=32, num_stages=3, dtype=float16`）：
-
-```
-LDS 占用 = 3 × (128×32 + 32×128) × 2 bytes
-         = 3 × (4096 + 4096) × 2
-         = 3 × 8192 × 2
-         = 48 KB
-```
-
-DCU 单 CU 的 LDS 上限为 64 KB，48 KB 已占用 75%，留给其他缓冲区（如 `C_shared` 写回中转）的空间不多。**调大 BM/BN/BK 或 num_stages 前，先用这个公式估算 LDS 是否超限。**
+**容量公式**：单 Buffer 的 LDS 占用 = `shape[0] × shape[1] × sizeof(dtype)` 字节。配合 `T.Pipelined` 的 `num_stages` 做多缓冲时，总占用 = `num_stages × (BM×BK + BK×BN) × sizeof(dtype)`。DCU 单 CU 的 LDS 上限为 64 KB，**调大 BM/BN/BK 或 num_stages 前，先用这个公式估算 LDS 是否超限**。
 
 ### `T.alloc_fragment` — 分配寄存器级缓冲区
 
@@ -218,15 +192,13 @@ T.fill(buf, value)     # 所有元素填充为指定值
 
 `T.copy(src, dst)` 是 TileLang 中统一的数据搬运原语，支持任意内存层级之间的传输。语义上是同步的：调用后 `dst` 中的数据保证可用。
 
-编译器会根据源/目标类型和目标架构自动选择最优底层指令（SIMT copy、ldmatrix、cp.async、TMA 等），并自动做 coalesce 保证 Global Memory 合并访问。
+编译器会根据源/目标类型和目标架构自动选择最优底层指令（SIMT copy、ldmatrix、cp.async、TMA 等），并自动做 coalesce 保证 Global Memory 合并访问。典型的搬运方向：
 
-| 搬运方向 | 代码 | 典型场景 |
-|---------|------|---------|
-| Global → Shared | `T.copy(A[by*BM, ko*BK], A_s)` | 分块 GEMM 主循环，每次加载一个 tile 到 LDS |
-| Shared → Fragment | `T.copy(A_shared, A_local)` | swizzle 中转：Shared 读取到寄存器 |
-| Fragment → Shared | `T.copy(A_local, A_shared)` | swizzle 中转：寄存器写入 Shared（做 swizzle 变换） |
-| Global → Fragment | `T.copy(A[...], A_local, coalesced_width=8)` | 直接加载到寄存器，绕开 Shared Memory |
-| Fragment → Global | `T.copy(C_f, C[by*BM, bx*BN])` | GEMM 结果写回全局内存 |
+```python
+T.copy(A[by*BM, ko*BK], A_s)          # Global → Shared：分块 GEMM 主循环
+T.copy(C_f, C[by*BM, bx*BN])          # Fragment → Global：结果写回
+T.copy(A[...], A_local, coalesced_width=8)  # Global → Fragment：绕开 Shared，直接加载到寄存器
+```
 
 **`coalesced_width` 参数**：指定 Global Memory 访问时的合并宽度（以元素为单位）。`coalesced_width=8` 表示编译器会尝试用 128-bit（8×16bit）向量化加载指令一次读取 8 个 fp16 元素。
 
@@ -283,23 +255,12 @@ T.gemm(A_local, B_local, C_f, k_pack=2, transpose_B=True,
 
 ### 逐元素数学运算
 
-以下原语可在 `prim_func` 内直接使用，对应 GPU 的逐元素运算指令。大部分映射到标准 TIR 算子，由编译器根据目标架构生成对应硬件指令。
+`T.exp/log/rsqrt/max/sigmoid/clamp/cast/infinity` 等语义与标准 math 函数一致，直接在 `prim_func` 中使用即可，不再赘述。以下是不太直观的几个：
 
 | 原语 | 用途 | 典型场景 |
 |------|------|---------|
-| `T.max(a, b)` | 取两数最大值 | ReLU、attention score 裁剪 |
-| `T.exp(x)` / `T.exp2(x)` | 指数 / 2 的指数 | softmax、attention |
-| `T.log(x)` / `T.log2(x)` | 自然对数 / 以 2 为底对数 | 交叉熵、log-softmax |
-| `T.rsqrt(x)` | 倒数平方根 | LayerNorm、RMSNorm |
-| `T.sigmoid(x)` | Sigmoid 激活 | 门控机制 |
-| `T.cast(x, dtype)` | 类型转换 | 精度切换（如 fp16 → fp32） |
-| `T.infinity(dtype)` | 该类型的无穷大值 | 归约初始化 |
-| `T.clamp(x, lo, hi)` | 限制在 [lo, hi] 范围 | 数值稳定性 |
-| `T.dp4a(A, B, C)` | 4 元素点积累加 | INT8 量化计算 |
-
-### `T.if_then_else` — 条件选择
-
-三元条件表达式，等价于 `cond ? true_val : false_val`。**不是控制流分支**，而是 IR 表达式，确保所有线程执行同一指令。
+| `T.dp4a(A, B, C)` | 4 元素点积累加 | INT8/INT4 量化 GEMM |
+| `T.if_then_else(cond, t, f)` | 条件选择表达式，**不是控制流分支**，所有线程执行同一指令 | 边界保护、条件赋值 |
 
 ```python
 C[gi] = T.if_then_else(gi < N, A[gi] + B[gi], 0.0)
@@ -466,6 +427,8 @@ for bx, by in T.Persistent(
 ---
 
 ## 六、布局注解（Layout Annotation）
+
+前几章的数据搬运和计算都是在"正确"层面工作——数据放对地方、算对结果。本章进入"高效"层面：通过控制数据在 Shared Memory 中的物理排布，减少 bank conflict，让带宽更接近硬件峰值。
 
 ### `T.annotate_layout` — 声明缓冲区的内存布局
 

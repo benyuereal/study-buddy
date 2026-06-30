@@ -65,6 +65,23 @@ KV cache 不是连续存储的，而是按固定大小 block（$B = 64$ 行/bloc
 | 后处理 | 无 | relu + 门控加权 + reduce_sum |
 | Grid 组织 | `(M, N)` 每 tile 一个 Block | `(max_block_len, batch)` 每个 logical KV block 一个 Block |
 
+### 1.5 伪代码
+
+```
+# 输入: Q [H, D], K [L, D], w [H]
+# 输出: logits [L]
+# 常量: BLOCK_KV = 64
+
+for each logical_block in 0 .. ceil(L / BLOCK_KV):
+    phys_block = block_table[logical_block]          # 查表：逻辑→物理地址
+    K_tile = KV_cache[phys_block]                    # 加载 K 块 [BLOCK_KV, D]
+    S = K_tile × Q^T                                 # GEMM: [BLOCK_KV, H]
+    S = relu(S) ⊙ w                                  # 融合后处理
+    logits[logical_block * BLOCK_KV : ...] = rowsum(S, dim=heads)   # 规约写回
+```
+
+每个 Block 独立处理一个 logical KV block，Block 之间无数据依赖。
+
 ---
 
 ## 二、性能数据
