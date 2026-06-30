@@ -336,6 +336,13 @@ def gemm(
         T.copy(C_f, C[by * BM, bx * BN])               # 结果写回
 ```
 
+运行输出示例：
+
+```
+Loading tilelang libs from dev root: /workspace/test/tilelang/build
+M=1024, N=1024, K=512, max_diff=0.031250, passed.
+```
+
 这是 TileLang 最经典的 GEMM 骨架：Global→Shared→gemm→Global。控制流优化（`T.Pipelined`、`T.Persistent`）将在下一章展开。
 
 ---
