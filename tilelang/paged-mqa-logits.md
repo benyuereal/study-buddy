@@ -26,7 +26,7 @@ $$
 \text{logits}[k] = \sum_{h=0}^{H-1} \mathrm{relu}\big(Q[h] \cdot K[k]\big) \times w[h], \quad k = 0, \dots, L-1
 $$
 
-**矩阵形式**（$K \in \mathbb{R}^{L \times D}$，$Q \in \mathbb{R}^{H \times D}$，$w \in \mathbb{R}^{H}$）：
+**矩阵形式**（$K \in \mathbb{R}^{L \times D}$, $Q \in \mathbb{R}^{H \times D}$, $w \in \mathbb{R}^{H}$）：
 
 $$
 \mathrm{logits} = \sum_{h=0}^{H-1} \mathrm{relu}(K Q^{\top}) \odot w
