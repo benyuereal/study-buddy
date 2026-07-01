@@ -8,9 +8,9 @@
 
 $$
 \begin{aligned}
-Q &\in \mathbb{R}^{H \times D} \quad &\text{（query，} H \text{ 头，每头 } D \text{ 维）} \\
-K &\in \mathbb{R}^{L \times D} \quad &\text{（历史 keys，} L \text{ 为 context 长度，MQA 下单头）} \\
-w &\in \mathbb{R}^{H} \quad &\text{（门控权重，每头一个标量）}
+Q &\in \mathbb{R}^{H \times D} \quad &\text{(query, } H \text{ 头，每头 } D \text{ 维)} \\
+K &\in \mathbb{R}^{L \times D} \quad &\text{(历史 keys, } L \text{ 为 context 长度，MQA 下单头)} \\
+w &\in \mathbb{R}^{H} \quad &\text{(门控权重，每头一个标量)}
 \end{aligned}
 $$
 
@@ -20,21 +20,21 @@ $$
 \text{logits} \in \mathbb{R}^{L}
 $$
 
-**计算**：
+**核心公式**：
 
 $$
-\boxed{\;\text{logits}[k] = \sum_{h=0}^{H-1} \operatorname{relu}\!\big(Q[h] \cdot K[k]\big) \times w[h]\;, \quad k = 0, \dots, L-1\;}
+\text{logits}[k] = \sum_{h=0}^{H-1} \mathrm{relu}\big(Q[h] \cdot K[k]\big) \times w[h], \quad k = 0, \dots, L-1
 $$
 
-**等价矩阵形式**：
+**矩阵形式**（$K \in \mathbb{R}^{L \times D},\; Q \in \mathbb{R}^{H \times D},\; w \in \mathbb{R}^{H}$）：
 
 $$
-\text{logits} = \operatorname{rowsum}\!\Big(\;\operatorname{relu}\!\big(K \, Q^{\top}\big) \odot w\;\Big)
+\text{logits} = \sum_{h=0}^{H-1} \mathrm{relu}(K \, Q^{\top}) \odot w
 $$
 
-其中 $K Q^{\top} \in \mathbb{R}^{L \times H}$（内积），$\operatorname{relu}$ 和 $\odot \, w$（广播）逐元素作用，$\operatorname{rowsum}$ 沿 heads 维度归约回 $\mathbb{R}^{L}$。
+即先做 $K Q^{\top}$ 得到 $[L, H]$ 的分数矩阵，逐元素 $\mathrm{relu}$ 后乘以门控权重 $w$（广播），最后沿 heads 维度求和得到 $[L]$ 的 logits 向量。
 
-> 对比标准 attention $\operatorname{softmax}(QK^{\top}/\sqrt{d})\,V$：这里**不做 softmax、不乘 V**，而是用 relu + 门控权重 + 多头求和替代，输出 logits 供下游模块使用。
+> **与标准 attention 的区别**：标准 attention 做 $\mathrm{softmax}(QK^{\top}/\sqrt{d})V$，这里**不做 softmax、不乘 V**，而是用 relu + 门控权重 + 多头求和替代。输出 logits 供下游路由/打分模块使用（如 DeepSeek-V2 MLA 架构）。
 
 ### 1.2 分块计算
 
