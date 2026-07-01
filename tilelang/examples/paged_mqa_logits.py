@@ -87,17 +87,27 @@ def paged_mqa_logits_kernel(
     """
     TileLang BF16 paged MQA logits kernel.
 
-    Grid: (max_num_blocks, batch_size) — one block per logical KV page (64 tokens).
-    Each block handles all heads for 1 query position.
+    MQA (Multi-Query Attention):
+      All heads share a single K, but each head has its own Q and gate weight.
+      Example: hidden_dim=4096, head_dim=128 → heads=32.
 
-    Workflow:
-      1. Load query [heads, head_dim] and weights [1, heads] into shared memory.
+      Q:       [heads=32, dim=128]     ← 32 heads, each 128-dim query
+      K:       [L, dim=128]            ← single key, no heads dimension
+      weights: [heads=32]              ← one scalar gate per head
+      logits[k] = sum_h(relu(Q[h] · K[k]) × w[h])
+
+    Grid: (max_num_blocks, batch_size) — one CTA per logical KV page (64 tokens)
+    per batch sample.  Each CTA internally tiles its 64 K-rows by tile_k_token.
+    T.Pipelined double-buffers the K tile load to overlap HBM→LDS copy with GEMM.
+
+    Workflow per CTA:
+      1. Load Q [heads, dim] and weights [heads] — reused across all K tiles.
       2. Look up physical KV page id from block_table.
-      3. For each tile of the 64 KV rows:
-         - Load KV tile into shared memory (with pipelining).
-         - GEMM: [tile_k_token, head_dim] × [heads, head_dim]^T → [tile_k_token, heads].
-         - Apply ReLU and head weights, then reduce-sum over heads → [tile_k_token].
-         - Write results to global logits.
+      3. For each K tile (size tile_k_token):
+         - Pipelined load of K tile into shared memory.
+         - GEMM: K [tile_k_token, dim] × Q^T [dim, heads] → S [tile_k_token, heads].
+         - Fused ReLU + gate weight × reduce_sum over heads → logits [tile_k_token].
+         - Write to global logits.
     """
     dim = head_dim
     dtype = T.bfloat16
@@ -121,35 +131,93 @@ def paged_mqa_logits_kernel(
         weights: T.Tensor([batch_size, heads], accum_dtype),
         block_table: T.Tensor([batch_size, max_num_blocks], index_dtype),
     ):
-        # Each thread block handles one logical KV page of one batch sample
+        # ================================================================
+        # Grid: (max_num_blocks, batch_size)
+        #   One CTA (thread block) per (logical KV page, batch sample).
+        #   Each CTA processes 64 K-rows (one KV page) for one batch sample,
+        #   internally tiling by tile_k_token with T.Pipelined double-buffering.
+        # ================================================================
         with T.Kernel(max_num_blocks, batch_size, threads=threads) as (kv_logical_page_idx, batch_idx):
-            # 1. Translate logical page index to physical page id via page table
+
+            # ------------------------------------------------------------
+            # Page table: logical page index → physical KV page id
+            #
+            # 🧱 KV Cache 内存结构 (BLOCK_KV=64, MQA 下单头 K):
+            #
+            #   kv_cache: [num_blocks, BLOCK_KV=64, 1, dim=128]
+            #   ┌──────────────────────────────┐  ← num_blocks 个物理页
+            #   │ Physical Page 0              │     每页 64 个 K token
+            #   │ ┌────┬────┬────┬───┬──────┐ │     每个 token 是 [dim=128] 向量
+            #   │ │tk₀ │tk₁ │tk₂ │...│ tk₆₃ │ │
+            #   │ └────┴────┴────┴───┴──────┘ │
+            #   ├──────────────────────────────┤
+            #   │ Physical Page 1              │
+            #   │ ┌────┬────┬────┬───┬──────┐ │
+            #   │ │tk₆₄│tk₆₅│tk₆₆│...│tk₁₂₇│ │  ← 逻辑 token [64,127] 映射到此页
+            #   │ └────┴────┴────┴───┴──────┘ │
+            #   ├──────────────────────────────┤
+            #   │ ...                          │
+            #   └──────────────────────────────┘
+            #
+            # 🔗 关键关系:
+            #   - 1 Token  → 1 个 K 向量 [dim=128]
+            #   - 1 Page   → 64 个 Token (BLOCK_KV)
+            #   - 1 Seq    → ceil_div(ctx_len, 64) 个逻辑页, 页表维护逻辑→物理映射
+            #
+            # block_table: [batch_size, max_num_blocks] int32
+            #   行 = batch 样本, 列 = 逻辑页索引 (0, 1, 2, ...)
+            #   值 = 物理页 ID (-1 表示未分配)
+            #
+            #   Example (batch 0, ctx_len=130, BLOCK_KV=64):
+            #     block_table[0] = [7, 12, -1, ...]
+            #       page_0: token [0,   63] → 物理页 7
+            #       page_1: token [64, 127] → 物理页 12
+            #       page_2: token [128,129] → 物理页 7 的偏移 0-1 (尾页复用, 不满 64)
+            #
+            #   phys_kv_page_id: 从哪页 *读取* K 数据
+            #   global_offset:   往哪 *写入* logits (按 token 顺序连续排布, 与物理页无关)
+            # ------------------------------------------------------------
             phys_kv_page_id = block_table[batch_idx, kv_logical_page_idx]
-            # Global token offset for this logical page (start position in the context sequence)
             global_offset = kv_logical_page_idx * BLOCK_KV
 
-            # Allocate shared memory for query, key tile, and fragments
+            # 分配 LDS 共享内存和寄存器缓冲区
+            #   q_smem: [heads=32, dim=128]  常驻 LDS，所有 K tile 复用
+            #   k_smem: [tile_k_token, dim]  双缓冲，T.Pipelined 自动切换
+            #   s:      [tile_k_token, heads] GEMM 累加器 (float32)
+            #   logits_tile: [tile_k_token]  reduce_sum 后的每个 token 标量值
+            #   w_frag: [heads=32]           每头一个门控权重标量
             q_smem = T.alloc_shared([heads, dim], dtype)
             k_smem = T.alloc_shared([tile_k_token, dim], dtype)
-            s = T.alloc_fragment([tile_k_token, heads], accum_dtype)      # GEMM output
-            logits_tile = T.alloc_fragment([tile_k_token], accum_dtype)   # per-token logits
-            w_frag = T.alloc_fragment([heads], accum_dtype)               # head weights
+            s = T.alloc_fragment([tile_k_token, heads], accum_dtype)
+            logits_tile = T.alloc_fragment([tile_k_token], accum_dtype)
+            w_frag = T.alloc_fragment([heads], accum_dtype)
 
-            # Load query and weights for this batch once
+            # 加载当前 batch 的 Q 和 weights（一整页的 tile 循环内复用）
+            #   Q: [heads=32, dim=128] → 32 个头各有 128 维 query
+            #   weights: [heads=32]     → 每个头一个门控标量
             T.copy(q[batch_idx, 0:heads, 0:dim], q_smem)
             T.copy(weights[batch_idx, 0:heads], w_frag)
 
-            # Process the 64 keys in tiles of size tile_k_token
+            # 一页 BLOCK_KV=64 个 token，按 tile_k_token 切分（如 32 → 2 次 GEMM）
+            #
+            # T.Pipelined: 软件流水线，串行执行但加载与计算重叠
+            #   tile_i 做 GEMM 时，tile_{i+1} 的 K 数据在后台从 HBM → LDS
+            #   num_stages: 双缓冲份数 (k_smem 分配 stages+1 份，编译器自动 swap)
+            #
             num_tiles = T.ceildiv(BLOCK_KV, tile_k_token)
             for tile_idx in T.Pipelined(num_tiles, num_stages=num_stages):
                 kv_row_start = tile_idx * tile_k_token
-                # Load key tile from physical KV page into shared memory
+
+                # 加载一个 K tile: [tile_k_token, dim=128] HBM → LDS
+                #   MQA 下 K 无 heads 维度，每个 token 就是 [dim=128] 向量
                 T.copy(
                     kv_cache[phys_kv_page_id, kv_row_start:kv_row_start + tile_k_token, 0, 0:dim],
                     k_smem
                 )
 
-                # GEMM: k_smem [tile_k_token, dim] × q_smem [heads, dim]^T → s [tile_k_token, heads]
+                # GEMM: K [tile_k_token, dim] × Q^T [dim, heads]
+                #       → scores [tile_k_token, heads]
+                #   transpose_B=True: Q 存 [heads, dim] 但计算需要 [dim, heads]
                 T.clear(s)
                 T.gemm(
                     k_smem, q_smem, s,
@@ -158,20 +226,87 @@ def paged_mqa_logits_kernel(
                     policy=gemm_policy,
                 )
 
-                # Apply ReLU and head weights, then reduce-sum over heads
+                # ReLU + 门控加权 (T.Parallel: 分发给 block 内所有线程并行执行)
+                #   score[row, head] = max(score, 0) * w[head]
                 for row_in_tile, head_idx in T.Parallel(tile_k_token, heads):
                     s[row_in_tile, head_idx] = (
                         T.max(s[row_in_tile, head_idx], T.cast(0, accum_dtype))
                         * w_frag[head_idx]
                     )
 
+                # 沿 heads 维度规约: [tile_k_token, 32] → [tile_k_token]
+                #   logits[k] = sum_h(relu(Q[h]·K[k]) × w[h])
+                #   每个 K token 得到一个标量，不同 tile 独立，无需跨 tile 累加
                 T.reduce_sum(s, logits_tile, dim=1, clear=True)
 
-                # Write results to global logits (only if within context length bounds)
+                # 写回全局 logits，global_pos 为 token 在上下文序列中的绝对位置
                 for row_in_tile in T.Parallel(tile_k_token):
                     global_pos = global_offset + kv_row_start + row_in_tile
                     if global_pos < max_context_len:
                         logits[batch_idx, global_pos] = logits_tile[row_in_tile]
+
+            # ──────────────────────────────────────────────────────────────
+            # T.Pipelined 流水线示意图 (BLOCK_KV=64, tile_k_token=32, num_stages=1)
+            #
+            #   一个物理 KV 页有 64 个 K token，切为 2 个 tile。双缓冲 (stages+1=2 份 k_smem)
+            #   让 tile 0 的 GEMM 和 tile 1 的 K 加载重叠：
+            #
+            #   时间 →
+            #   ┌─────────────────────────────────────────────────────┐
+            #   │ tile 0                                               │
+            #   │  [加载 K[ 0:32] HBM→LDS]                             │
+            #   │                        [GEMM K[ 0:32]×Q^T → scores] │
+            #   │                        [ReLU×w → reduce_sum]         │
+            #   │                        [写回 logits[0:32]]           │
+            #   ├─────────────────────────────────────────────────────┤
+            #   │ tile 1                    ↑ 与 tile 0 的 GEMM 重叠    │
+            #   │  [加载 K[32:64] HBM→LDS]  ↑                         │
+            #   │                        [GEMM K[32:64]×Q^T → scores]  │
+            #   │                        [ReLU×w → reduce_sum]          │
+            #   │                        [写回 logits[32:64]]           │
+            #   └─────────────────────────────────────────────────────┘
+            #
+            #   每 tile 内部计算流程 (以 tile 0 为例，tile_k_token=32, heads=32, dim=128):
+            #
+            #   KV Page (物理页)
+            #   ┌──────────────────────────┐
+            #   │ K[ 0]  [dim=128]         │────┐
+            #   │ K[ 1]  [dim=128]         │    │  T.copy → k_smem [32,128]  (LDS)
+            #   │ ...                      │    │
+            #   │ K[31]  [dim=128]         │────┘
+            #   ├──────────────────────────┤
+            #   │ K[32]  [dim=128]         │  ← 下一 tile，流水线后台加载
+            #   │ ...                      │
+            #   │ K[63]  [dim=128]         │
+            #   └──────────────────────────┘
+            #                    ×
+            #   q_smem [32, 128]  (LDS 常驻)
+            #   ┌──────────────────────────┐
+            #   │ Q_head0  [dim=128]        │
+            #   │ Q_head1  [dim=128]        │
+            #   │ ...                       │
+            #   │ Q_head31 [dim=128]        │
+            #   └──────────────────────────┘
+            #                    ↓
+            #   T.gemm → s [32, 32]  (寄存器)
+            #   ┌──────────────────────────┐
+            #   │ 行=K token (0..31)        │
+            #   │ 列=head (0..31)           │
+            #   │ 值 = Q[h] · K[k] (内积)    │
+            #   └──────────────────────────┘
+            #                    ↓
+            #   ReLU + ×w_frag[head]  (逐元素, T.Parallel 线程并行)
+            #                    ↓
+            #   T.reduce_sum(dim=1) → logits_tile [32]
+            #   ┌──────────────────────────┐
+            #   │ logits[ 0] = Σ_h relu(Q[h]·K[ 0]) × w[h] │
+            #   │ logits[ 1] = Σ_h relu(Q[h]·K[ 1]) × w[h] │
+            #   │ ...                                         │
+            #   │ logits[31] = Σ_h relu(Q[h]·K[31]) × w[h] │
+            #   └──────────────────────────┘
+            #                    ↓
+            #   T.copy → logits[batch_idx, global_offset:global_offset+32]
+            # ──────────────────────────────────────────────────────────────
 
     return kernel
 
