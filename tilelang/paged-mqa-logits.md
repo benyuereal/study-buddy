@@ -26,7 +26,7 @@ $$
 \text{logits}[k] = \sum_{h=0}^{H-1} \mathrm{relu}\big(Q[h] \cdot K[k]\big) \times w[h], \quad k = 0, \dots, L-1
 $$
 
-**矩阵形式**（$K \in \mathbb{R}^{L \times D}$, $Q \in \mathbb{R}^{H \times D}$, $w \in \mathbb{R}^{H}$）：
+**矩阵形式**（$K \in \mathbb{R}^{L \times D}$，$Q \in \mathbb{R}^{H \times D}$，$w \in \mathbb{R}^{H}$）：
 
 $$
 \mathrm{logits} = \sum_{h=0}^{H-1} \mathrm{relu}(K Q^{\top}) \odot w
@@ -38,10 +38,10 @@ $$
 
 ### 1.2 分块计算
 
-K 按固定大小 $B = 64$ 行切分为逻辑块。对第 $t$ 个逻辑块（$K_t \in \mathbb{R}^{B \times D}$）：
+K 按固定大小 $B = 64$ 行切分为逻辑块。对第 $t$ 个逻辑块（$K_{t} \in \mathbb{R}^{B \times D}$）：
 
 $$
-\mathrm{logits}_t = \sum_{h=0}^{H-1} \mathrm{relu}(K_t Q^{\top}) \odot w \quad \in \mathbb{R}^{B}
+\mathrm{logits}_{t} = \sum_{h=0}^{H-1} \mathrm{relu}(K_{t} Q^{\top}) \odot w \quad \in \mathbb{R}^{B}
 $$
 
 每个 CTA 处理一个逻辑块，通过 `block_table` 查表找到 $K_t$ 所在的物理地址。
