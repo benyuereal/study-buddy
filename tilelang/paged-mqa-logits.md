@@ -69,7 +69,9 @@ KV cache 不是连续存储的，而是按固定大小 block（$B = 64$ 行/bloc
 
 ## 二、性能数据
 
-DCU 上实测，以手写 HIP 汇编的 lightop 为 baseline：
+### 2.1 DCU 实测 vs 手写 HIP 汇编
+
+以 lightop 手写 HIP 汇编为 baseline：
 
 ```
 Case                             B    H    D  avg_ctx  tilelang(ms)   lightop(ms)   speedup
@@ -83,32 +85,26 @@ bs1_H32_D128_72k                 1   32  128    72000         0.121         0.07
 bs1_H64_D128_72k                 1   64  128    72000         0.120         0.084     1.42x
 ```
 
-结论：
+- **大 batch（≥64）**：与手写汇编基本持平（0.94x ~ 1.34x）
+- **小 batch（=1）**：慢 1.4x ~ 1.8x，Grid block 数太少，多数 CU 闲置
 
-- **大 batch（≥64）**：与手写汇编基本持平（0.94x ~ 1.34x），Python DSL 能做到这个性能是编译器自动向量化 + 流水线优化的直接体现。
-- **小 batch（=1）**：比手写汇编慢 1.4x ~ 1.8x。小 batch 时 Grid 太小（max_block_len 个 Block 分散到 80 个 CU，多数 CU 闲置），手写汇编可以做 warp-specialized 的细粒度优化，TileLang 的通用流水线在这个场景下开销占比放大。
+### 2.2 vLLM Profiler：GLM-5.1 优化前后
 
-### 2.1 vLLM Profiler 实测：优化前后对比
-
-以下为 GLM-5.1 模型（**78 层**）在 vLLM 中的 profiler 实测数据。优化前使用 vLLM 默认 CUDA kernel，优化后替换为本 TileLang paged_mqa_logits 算子。
+GLM-5.1 共 **78 层**，优化前为 vLLM 默认 CUDA kernel，优化后替换为本 TileLang 算子。
 
 | 指标 | 优化前 | 优化后 | 提升 |
 |------|--------|--------|------|
 | **算子延迟** | ~1 ms | ~10 μs | **~100×** |
 | **单层 Layer 延迟** | ~4 ms | ~3 ms | **-1 ms（-25%）** |
 | **78 层总延迟** | ~312 ms | ~234 ms | **-78 ms（-25%）** |
-| **端到端 TPOT** | — | — | **显著降低，decoding 阶段每 token 生成更快** |
 
-> **说明**：
-> - **算子延迟**：`paged_mqa_logits` 单个 kernel 调用耗时，从毫秒级降至微秒级，提升约 100 倍
-> - **单层 Layer 延迟**：一个 Transformer layer 的总耗时（含 attention、MLP 等），由于 paged_mqa_logits 只是 attention 的一部分，单层节省约 1ms
-> - **累积效应**：GLM-5.1 共 78 层，每层节省 1ms → 一次 decoding step 节省约 78ms，对长序列生成场景的 TPOT（Time Per Output Token）提升显著
+> 算子从毫秒级降至微秒级（~100×），单层节省 ~1ms，78 层累积节省 ~78ms/step。
 
-<img src="assets/paged_mqa_logits_pre.png" width="600" alt="优化前">
+<img src="assets/paged_mqa_logits_pre.png" width="80%" alt="优化前">
 
 > 优化前：算子耗时 ~1ms，是单层 Layer 的性能瓶颈。
 
-<img src="assets/paged_mqa_logits_after.png" width="600" alt="优化后">
+<img src="assets/paged_mqa_logits_after.png" width="80%" alt="优化后">
 
 > 优化后：算子耗时 ~10μs，瓶颈消除，单层从 4ms → 3ms。
 
@@ -441,24 +437,6 @@ Grid 启动 (max_num_blocks × batch_size) 个 CTA
 | **Warp 分区策略** | `GemmWarpPolicy.Square / FullRow` | 小 batch 用 FullRow 减少 warp 间通信开销 |
 | **动态形状 JIT** | `T.dynamic` + `@tilelang.jit` | batch_size、max_context_len 等运行时可变维度在 kernel 启动时确定，编译时做特化优化 |
 | **Fast Math** | `TL_ENABLE_FAST_MATH` | 允许编译器用近似指令替换精确数学函数（如 reciprocal），提升吞吐 |
-
-### 这个算子没有用到的优化（为什么？）
-
-| 未使用 | 原因 |
-|--------|------|
-| Swizzle 布局 (`T.annotate_layout`) | `T.gemm` 的输入是 Shared Memory 而非 Fragment 中转，编译器自动处理 bank conflict，不需要手动 swizzle |
-| `T.Persistent` | 每个 Block 处理 64 行 KV，计算量已足够大，持久化调度反而增加寄存器压力 |
-| `T.async_copy` | `T.Pipelined` 的自动流水线已满足需求，不需要手动控制异步预取时机 |
-| D 维度拆分 | `D=128` 不大，拆分反而增加 Shared Memory 分配碎片和额外同步 |
-
-### 这个算子没有用到的优化（为什么？）
-
-| 未使用 | 原因 |
-|--------|------|
-| Swizzle 布局 (`T.annotate_layout`) | `T.gemm` 的输入是 Shared Memory 而非 Fragment 中转，编译器自动处理 bank conflict，不需要手动 swizzle |
-| `T.Persistent` | 每个 Block 处理 64 行 KV，计算量已足够大，持久化调度反而增加寄存器压力 |
-| `T.async_copy` | `T.Pipelined` 的自动流水线已满足需求，不需要手动控制异步预取时机 |
-| D 维度拆分 | `D=128` 不大，拆分反而增加 Shared Memory 分配碎片和额外同步 |
 
 ---
 
