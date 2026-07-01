@@ -44,44 +44,42 @@ def ceil_div(x: int, y: int) -> int:
 # Kernel: paged_mqa_logits (BF16)
 # ============================================================================
 
-def _pick_block_config(heads: int, head_dim: int):
+def _pick_tile_config(heads: int, head_dim: int):
     """
-    Pick the best tile size (block_N) and pipelining stages for shared memory budget.
-    Returns (block_N, num_stages, lds_bytes_used).
+    Pick the best K-token tile size and pipeline stages under the LDS budget.
+
+    Strategy (greedy, in priority order):
+      1. More pipeline stages  → better latency hiding
+      2. Smaller tile_k_token  → less LDS, more SM residency headroom
+
+    Returns (tile_k_token, num_stages, lds_bytes_used).
     """
     dim = head_dim
-    h = heads
+    q_smem_bytes = heads * dim * 2  # Q sits in LDS full-time; not pipelined
 
-    # Shared memory for query: [heads, head_dim] in BF16 (2 bytes each)
-    q_smem_bytes = h * dim * 2
+    # Collect all (tile_k_token, stages) combinations that fit in LDS
+    candidates = []
+    for tile_n in (32, 64):
+        for stages in (2, 1, 0):
+            k_smem_bytes = (stages + 1) * tile_n * dim * 2
+            lds_used = q_smem_bytes + k_smem_bytes
+            if lds_used <= LDS_LIMIT:
+                candidates.append((tile_n, stages, lds_used))
 
-    best = None
-    for block_n in (32, 64):                     # Possible tile sizes for keys
-        for stages in (2, 1, 0):                 # Number of pipelining stages
-            k_smem_bytes = (stages + 1) * block_n * dim * 2
-            total = q_smem_bytes + k_smem_bytes
-            if total <= LDS_LIMIT:
-                if best is None:
-                    best = (block_n, stages, total)
-                else:
-                    prev_block_n, prev_stages, _ = best
-                    # Prefer more stages, then smaller block_n
-                    if stages > prev_stages:
-                        best = (block_n, stages, total)
-                    elif stages == prev_stages and block_n < prev_block_n:
-                        best = (block_n, stages, total)
+    if not candidates:
+        # No config fits — minimum tile with no pipelining as fallback
+        return 32, 0, q_smem_bytes + 32 * dim * 2
 
-    if best is None:
-        best = (32, 0, 0)   # fallback
-
-    return best[0], best[1], best[2]
+    # Sort: prefer more stages, then smaller tile_n
+    candidates.sort(key=lambda x: (-x[1], x[0]))
+    return candidates[0]
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
 def paged_mqa_logits_kernel(
     heads: int,
     head_dim: int,
-    block_N: int = 64,
+    tile_k_token: int = 64,
     num_stages: int = 1,
     threads: int = 256,
     policy: str = "square",
@@ -89,16 +87,16 @@ def paged_mqa_logits_kernel(
     """
     TileLang BF16 paged MQA logits kernel.
 
-    Grid: (max_num_blocks, batch_size) — one block per logical KV block (64 rows).
+    Grid: (max_num_blocks, batch_size) — one block per logical KV page (64 tokens).
     Each block handles all heads for 1 query position.
 
     Workflow:
       1. Load query [heads, head_dim] and weights [1, heads] into shared memory.
-      2. Get physical block ID from block_table.
+      2. Look up physical KV page id from block_table.
       3. For each tile of the 64 KV rows:
          - Load KV tile into shared memory (with pipelining).
-         - GEMM: [block_N, head_dim] × [heads, head_dim]^T → [block_N, heads].
-         - Apply ReLU and head weights, then reduce-sum over heads → [block_N].
+         - GEMM: [tile_k_token, head_dim] × [heads, head_dim]^T → [tile_k_token, heads].
+         - Apply ReLU and head weights, then reduce-sum over heads → [tile_k_token].
          - Write results to global logits.
     """
     dim = head_dim
@@ -123,35 +121,35 @@ def paged_mqa_logits_kernel(
         weights: T.Tensor([batch_size, heads], accum_dtype),
         block_table: T.Tensor([batch_size, max_num_blocks], index_dtype),
     ):
-        # Each thread block handles one logical block of one batch sample
-        with T.Kernel(max_num_blocks, batch_size, threads=threads) as (logical_block_idx, batch_idx):
-            # 1. Translate logical block to physical block via page table
-            phys_block = block_table[batch_idx, logical_block_idx]
-            # Global token offset for this logical block (start position)
-            global_offset = logical_block_idx * BLOCK_KV
+        # Each thread block handles one logical KV page of one batch sample
+        with T.Kernel(max_num_blocks, batch_size, threads=threads) as (kv_logical_page_idx, batch_idx):
+            # 1. Translate logical page index to physical page id via page table
+            phys_kv_page_id = block_table[batch_idx, kv_logical_page_idx]
+            # Global token offset for this logical page (start position in the context sequence)
+            global_offset = kv_logical_page_idx * BLOCK_KV
 
             # Allocate shared memory for query, key tile, and fragments
             q_smem = T.alloc_shared([heads, dim], dtype)
-            k_smem = T.alloc_shared([block_N, dim], dtype)
-            s = T.alloc_fragment([block_N, heads], accum_dtype)      # GEMM output
-            logits_tile = T.alloc_fragment([block_N], accum_dtype)   # per-token logits
-            w_frag = T.alloc_fragment([heads], accum_dtype)          # head weights
+            k_smem = T.alloc_shared([tile_k_token, dim], dtype)
+            s = T.alloc_fragment([tile_k_token, heads], accum_dtype)      # GEMM output
+            logits_tile = T.alloc_fragment([tile_k_token], accum_dtype)   # per-token logits
+            w_frag = T.alloc_fragment([heads], accum_dtype)               # head weights
 
             # Load query and weights for this batch once
             T.copy(q[batch_idx, 0:heads, 0:dim], q_smem)
             T.copy(weights[batch_idx, 0:heads], w_frag)
 
-            # Process the 64 keys in tiles of size block_N
-            num_tiles = T.ceildiv(BLOCK_KV, block_N)
+            # Process the 64 keys in tiles of size tile_k_token
+            num_tiles = T.ceildiv(BLOCK_KV, tile_k_token)
             for tile_idx in T.Pipelined(num_tiles, num_stages=num_stages):
-                kv_row_start = tile_idx * block_N
-                # Load key tile from physical block into shared memory
+                kv_row_start = tile_idx * tile_k_token
+                # Load key tile from physical KV page into shared memory
                 T.copy(
-                    kv_cache[phys_block, kv_row_start:kv_row_start + block_N, 0, 0:dim],
+                    kv_cache[phys_kv_page_id, kv_row_start:kv_row_start + tile_k_token, 0, 0:dim],
                     k_smem
                 )
 
-                # GEMM: k_smem [block_N, dim] × q_smem [heads, dim]^T → s [block_N, heads]
+                # GEMM: k_smem [tile_k_token, dim] × q_smem [heads, dim]^T → s [tile_k_token, heads]
                 T.clear(s)
                 T.gemm(
                     k_smem, q_smem, s,
@@ -161,7 +159,7 @@ def paged_mqa_logits_kernel(
                 )
 
                 # Apply ReLU and head weights, then reduce-sum over heads
-                for row_in_tile, head_idx in T.Parallel(block_N, heads):
+                for row_in_tile, head_idx in T.Parallel(tile_k_token, heads):
                     s[row_in_tile, head_idx] = (
                         T.max(s[row_in_tile, head_idx], T.cast(0, accum_dtype))
                         * w_frag[head_idx]
@@ -169,8 +167,8 @@ def paged_mqa_logits_kernel(
 
                 T.reduce_sum(s, logits_tile, dim=1, clear=True)
 
-                # Write results to global logits (only if within actual context length)
-                for row_in_tile in T.Parallel(block_N):
+                # Write results to global logits (only if within context length bounds)
+                for row_in_tile in T.Parallel(tile_k_token):
                     global_pos = global_offset + kv_row_start + row_in_tile
                     if global_pos < max_context_len:
                         logits[batch_idx, global_pos] = logits_tile[row_in_tile]
@@ -294,30 +292,30 @@ def run_tilelang(
     assert next_n == 1, "Only next_n=1 is supported."
 
     # Pick optimal tiling configuration
-    block_N, num_stages, lds_bytes = _pick_block_config(heads, head_dim)
+    tile_k_token, num_stages, lds_bytes = _pick_tile_config(heads, head_dim)
 
     # For very small batches, we can use a larger tile and FullRow policy
     use_full_row = False
-    if batch_size <= 4 and block_N == 32:
+    if batch_size <= 4 and tile_k_token == 32:
         q_smem = heads * head_dim * 2
         k_smem_64 = 64 * head_dim * 2
         if q_smem + k_smem_64 <= LDS_LIMIT:
-            block_N = 64
+            tile_k_token = 64
             num_stages = 0
             lds_bytes = q_smem + k_smem_64
             use_full_row = True
 
     # Cache and compile the kernel
-    cache_key = (heads, head_dim, block_N, num_stages, use_full_row)
+    cache_key = (heads, head_dim, tile_k_token, num_stages, use_full_row)
     if cache_key not in _kernel_cache:
         policy_str = "full_row" if use_full_row else "square"
         print(f"  [tilelang config] H={heads}, dim={head_dim}, "
-              f"block_N={block_N}, num_stages={num_stages}, policy={policy_str}, "
+              f"tile_k_token={tile_k_token}, num_stages={num_stages}, policy={policy_str}, "
               f"LDS={lds_bytes / 1024:.1f}KB / {LDS_LIMIT / 1024:.0f}KB")
         _kernel_cache[cache_key] = paged_mqa_logits_kernel(
             heads=heads,
             head_dim=head_dim,
-            block_N=block_N,
+            tile_k_token=tile_k_token,
             num_stages=num_stages,
             policy=policy_str,
         )
