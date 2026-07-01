@@ -12,73 +12,67 @@ Where:
     fused_kv_cache:  [num_blocks, block_size, 1, head_dim]  BF16 (block_size=64)
     weights:         [batch_size * next_n, heads]            float32
     context_lens:    [batch_size]                            int32
-    block_table:     [batch_size, max_block_len]             int32
-    schedule_meta:   [num_sms+1, 2] or None                 int32
+    block_table:     [batch_size, max_num_blocks]            int32
+    schedule_meta:   [num_sms+1, 2] or None                 int32 (ignored)
     max_context_len: int
 
 Returns:
     logits:          [batch_size * next_n, max_context_len]  float32
-
-Architecture:
-  - Grid: (max_block_len, batch_size) — one block per logical KV block (64 rows)
-  - Q loaded as [heads, D], KV loaded as [block_N, D] with Pipelining
-  - T.gemm with Square policy, k_pack=1, relu×weight, reduce_sum over heads
 """
 
 import argparse
 import random
 import sys
-from typing import Optional, Tuple
+from typing import Optional
 
 import tilelang
 from tilelang import language as T
 import torch
 
+# ============================================================================
+# Constants
+# ============================================================================
+LDS_LIMIT = 80 * 1024          # Maximum shared memory per block (bytes)
+BLOCK_KV = 64                  # Number of tokens per physical KV block
 
-# ============================================================================
-# Helpers
-# ============================================================================
 
 def ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
 # ============================================================================
-# tilelang kernel: paged_mqa_logits (BF16)
+# Kernel: paged_mqa_logits (BF16)
 # ============================================================================
 
-LDS_LIMIT = 80 * 1024
-
-BLOCK_KV = 64
-
-
-def _pick_block_config(heads: int, index_dim: int):
-    """Pick block_N, num_stages for shared memory budget.
-
-    No D-splitting needed: accumulator [block_N, heads] is small enough for registers.
+def _pick_block_config(heads: int, head_dim: int):
     """
-    D = index_dim
-    H = heads
+    Pick the best tile size (block_N) and pipelining stages for shared memory budget.
+    Returns (block_N, num_stages, lds_bytes_used).
+    """
+    dim = head_dim
+    h = heads
 
-    q_smem = H * D * 2  # [heads, D] in BF16
+    # Shared memory for query: [heads, head_dim] in BF16 (2 bytes each)
+    q_smem_bytes = h * dim * 2
 
     best = None
-    for bn in (32, 64):
-        for ns in (2, 1, 0):
-            k_smem = (ns + 1) * bn * D * 2
-            total = q_smem + k_smem
+    for block_n in (32, 64):                     # Possible tile sizes for keys
+        for stages in (2, 1, 0):                 # Number of pipelining stages
+            k_smem_bytes = (stages + 1) * block_n * dim * 2
+            total = q_smem_bytes + k_smem_bytes
             if total <= LDS_LIMIT:
                 if best is None:
-                    best = (bn, ns, total)
+                    best = (block_n, stages, total)
                 else:
-                    bN0, ns0, tot0 = best
-                    if ns > ns0:
-                        best = (bn, ns, total)
-                    elif ns == ns0 and bn < bN0:
-                        best = (bn, ns, total)
+                    prev_block_n, prev_stages, _ = best
+                    # Prefer more stages, then smaller block_n
+                    if stages > prev_stages:
+                        best = (block_n, stages, total)
+                    elif stages == prev_stages and block_n < prev_block_n:
+                        best = (block_n, stages, total)
 
     if best is None:
-        best = (32, 0, 0)
+        best = (32, 0, 0)   # fallback
 
     return best[0], best[1], best[2]
 
@@ -86,90 +80,109 @@ def _pick_block_config(heads: int, index_dim: int):
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
 def paged_mqa_logits_kernel(
     heads: int,
-    index_dim: int,
+    head_dim: int,
     block_N: int = 64,
     num_stages: int = 1,
     threads: int = 256,
     policy: str = "square",
 ):
-    """TileLang BF16 paged MQA logits kernel.
+    """
+    TileLang BF16 paged MQA logits kernel.
 
-    Grid: (max_block_len, batch_size) — one block per logical KV block (64 rows).
+    Grid: (max_num_blocks, batch_size) — one block per logical KV block (64 rows).
     Each block handles all heads for 1 query position.
 
-    Architecture:
-      1. Load Q [heads, D] and weights [1, heads] into smem
-      2. Look up physical block from block_table
-      3. For each block_N tile of the 64 KV rows:
-         - T.clear accumulator, load KV tile into smem (pipelined)
-         - T.gemm: [block_N, D] × [heads, D]^T → [block_N, heads]
-         - relu×weight, reduce_sum → [block_N]
-         - Write to global logits
+    Workflow:
+      1. Load query [heads, head_dim] and weights [1, heads] into shared memory.
+      2. Get physical block ID from block_table.
+      3. For each tile of the 64 KV rows:
+         - Load KV tile into shared memory (with pipelining).
+         - GEMM: [block_N, head_dim] × [heads, head_dim]^T → [block_N, heads].
+         - Apply ReLU and head weights, then reduce-sum over heads → [block_N].
+         - Write results to global logits.
     """
-    D = index_dim
-
+    dim = head_dim
     dtype = T.bfloat16
     accum_dtype = T.float32
     index_dtype = T.int32
 
-    # k_pack=1 for RDNA (gfx936); k_pack=2 would be for CDNA
-    K_PACK = 1
+    K_PACK = 1   # For RDNA (gfx936); CDNA could use 2
+    gemm_policy = T.GemmWarpPolicy.FullRow if policy == "full_row" else T.GemmWarpPolicy.Square
 
-    _policy = T.GemmWarpPolicy.FullRow if policy == "full_row" else T.GemmWarpPolicy.Square
-
+    # Dynamic dimensions
     batch_size = T.dynamic("batch_size")
     num_blocks = T.dynamic("num_blocks")
-    max_block_len = T.dynamic("max_block_len")
+    max_num_blocks = T.dynamic("max_num_blocks")
     max_context_len = T.dynamic("max_context_len")
 
     @T.prim_func
     def kernel(
-        Q: T.Tensor([batch_size, heads, D], dtype),
-        KV: T.Tensor([num_blocks, BLOCK_KV, 1, D], dtype),
-        Logits: T.Tensor([batch_size, max_context_len], accum_dtype),
-        Weights: T.Tensor([batch_size, heads], accum_dtype),
-        BlockTable: T.Tensor([batch_size, max_block_len], index_dtype),
+        q: T.Tensor([batch_size, heads, dim], dtype),
+        kv_cache: T.Tensor([num_blocks, BLOCK_KV, 1, dim], dtype),
+        logits: T.Tensor([batch_size, max_context_len], accum_dtype),
+        weights: T.Tensor([batch_size, heads], accum_dtype),
+        block_table: T.Tensor([batch_size, max_num_blocks], index_dtype),
     ):
-        with T.Kernel(max_block_len, batch_size, threads=threads) as (logical_block, b_idx):
-            phys_block = BlockTable[b_idx, logical_block]
-            kv_offset_global = logical_block * BLOCK_KV
+        # Each thread block handles one logical block of one batch sample
+        with T.Kernel(max_num_blocks, batch_size, threads=threads) as (logical_block_idx, batch_idx):
+            # 1. Translate logical block to physical block via page table
+            phys_block = block_table[batch_idx, logical_block_idx]
+            # Global token offset for this logical block (start position)
+            global_offset = logical_block_idx * BLOCK_KV
 
-            q_smem = T.alloc_shared([heads, D], dtype)
-            k_smem = T.alloc_shared([block_N, D], dtype)
-            s = T.alloc_fragment([block_N, heads], accum_dtype)
-            logits_tile = T.alloc_fragment([block_N], accum_dtype)
-            w_frag = T.alloc_fragment([heads], accum_dtype)
+            # Allocate shared memory for query, key tile, and fragments
+            q_smem = T.alloc_shared([heads, dim], dtype)
+            k_smem = T.alloc_shared([block_N, dim], dtype)
+            s = T.alloc_fragment([block_N, heads], accum_dtype)      # GEMM output
+            logits_tile = T.alloc_fragment([block_N], accum_dtype)   # per-token logits
+            w_frag = T.alloc_fragment([heads], accum_dtype)          # head weights
 
-            T.copy(Q[b_idx, 0:heads, 0:D], q_smem)
-            T.copy(Weights[b_idx, 0:heads], w_frag)
+            # Load query and weights for this batch once
+            T.copy(q[batch_idx, 0:heads, 0:dim], q_smem)
+            T.copy(weights[batch_idx, 0:heads], w_frag)
 
-            for nbn_i in T.Pipelined(T.ceildiv(BLOCK_KV, block_N), num_stages=num_stages):
-                kv_row = nbn_i * block_N
-                T.copy(KV[phys_block, kv_row:kv_row + block_N, 0, 0:D], k_smem)
+            # Process the 64 keys in tiles of size block_N
+            num_tiles = T.ceildiv(BLOCK_KV, block_N)
+            for tile_idx in T.Pipelined(num_tiles, num_stages=num_stages):
+                kv_row_start = tile_idx * block_N
+                # Load key tile from physical block into shared memory
+                T.copy(
+                    kv_cache[phys_block, kv_row_start:kv_row_start + block_N, 0, 0:dim],
+                    k_smem
+                )
 
+                # GEMM: k_smem [block_N, dim] × q_smem [heads, dim]^T → s [block_N, heads]
                 T.clear(s)
                 T.gemm(
                     k_smem, q_smem, s,
-                    k_pack=K_PACK, transpose_B=True,
-                    policy=_policy,
+                    k_pack=K_PACK,
+                    transpose_B=True,
+                    policy=gemm_policy,
                 )
 
-                for bn_i, h_i in T.Parallel(block_N, heads):
-                    s[bn_i, h_i] = T.max(s[bn_i, h_i], T.cast(0, accum_dtype)) * w_frag[h_i]
+                # Apply ReLU and head weights, then reduce-sum over heads
+                for row_in_tile, head_idx in T.Parallel(block_N, heads):
+                    s[row_in_tile, head_idx] = (
+                        T.max(s[row_in_tile, head_idx], T.cast(0, accum_dtype))
+                        * w_frag[head_idx]
+                    )
 
                 T.reduce_sum(s, logits_tile, dim=1, clear=True)
 
-                for bn_i in T.Parallel(block_N):
-                    gkv = kv_offset_global + kv_row + bn_i
-                    if gkv < max_context_len:
-                        Logits[b_idx, gkv] = logits_tile[bn_i]
+                # Write results to global logits (only if within actual context length)
+                for row_in_tile in T.Parallel(block_N):
+                    global_pos = global_offset + kv_row_start + row_in_tile
+                    if global_pos < max_context_len:
+                        logits[batch_idx, global_pos] = logits_tile[row_in_tile]
 
     return kernel
 
 
 @tilelang.jit
-def clean_paged_logits_tl(threads: int = 256, block_K: int = 4096):
-    """Mask positions >= context_len with -inf for each batch row."""
+def clean_paged_logits(threads: int = 256, block_K: int = 4096):
+    """
+    Mask positions >= context_len with -inf for each batch row.
+    """
     batch_size = T.dynamic("batch_size")
     max_context_len = T.dynamic("max_context_len")
     dtype = T.float
@@ -177,23 +190,26 @@ def clean_paged_logits_tl(threads: int = 256, block_K: int = 4096):
 
     @T.prim_func
     def kernel(
-        Logits: T.Tensor([batch_size, max_context_len], dtype),
-        ContextLens: T.Tensor([batch_size], indices_dtype),
+        logits: T.Tensor([batch_size, max_context_len], dtype),
+        context_lens: T.Tensor([batch_size], indices_dtype),
     ):
-        with T.Kernel(batch_size, threads=threads) as bx:
-            tx = T.thread_binding(0, threads, thread="threadIdx.x")
-            ctx_len = ContextLens[bx]
-            for n_i in T.Pipelined(T.ceildiv(max_context_len, block_K)):
-                for k_i in T.serial(block_K // threads):
-                    idx = n_i * block_K + k_i * threads + tx
-                    if idx >= ctx_len:
-                        Logits[bx, idx] = -T.infinity(dtype)
+        with T.Kernel(batch_size, threads=threads) as batch_idx:
+            tid = T.thread_binding(0, threads, thread="threadIdx.x")
+            ctx_len = context_lens[batch_idx]
+
+            # Loop over chunks of size block_K
+            for chunk in T.Pipelined(T.ceildiv(max_context_len, block_K)):
+                # Each thread handles several positions within the chunk
+                for i in T.serial(block_K // threads):
+                    pos = chunk * block_K + i * threads + tid
+                    if pos >= ctx_len:
+                        logits[batch_idx, pos] = -T.infinity(dtype)
 
     return kernel
 
 
 # ============================================================================
-# PyTorch reference implementation (matches lightop's ref_fp8_paged_mqa_logits)
+# PyTorch Reference Implementation
 # ============================================================================
 
 def ref_paged_mqa_logits(
@@ -204,45 +220,59 @@ def ref_paged_mqa_logits(
     block_table: torch.Tensor,
     max_model_len: int,
 ):
-    """PyTorch reference: same algorithm as lightop's ref_fp8_paged_mqa_logits."""
-    batch_size, next_n, heads, dim = q.shape
+    """
+    Pure PyTorch implementation for correctness validation.
+    Follows the same algorithm as lightop's ref_fp8_paged_mqa_logits.
+    """
+    batch_size, next_n, heads, head_dim = q.shape
     block_size = kv_cache.shape[1]
 
     logits = torch.full(
         [batch_size * next_n, max_model_len],
-        float('-inf'), device=q.device, dtype=torch.float32,
+        float('-inf'),
+        device=q.device,
+        dtype=torch.float32,
     )
     ctx_list = context_lens.tolist()
 
-    for i in range(batch_size):
-        ctx_len = ctx_list[i]
+    for b in range(batch_size):
+        ctx_len = ctx_list[b]
         q_offsets = torch.arange(ctx_len - next_n, ctx_len, device=q.device)
-        weight_slice = weights[i * next_n:(i + 1) * next_n, :].transpose(0, 1).contiguous()
+        weight_slice = weights[b * next_n:(b + 1) * next_n, :].transpose(0, 1).contiguous()
 
         for block_rk in range(ceil_div(ctx_len, block_size)):
-            block_idx = block_table[i][block_rk].item()
-            qx = q[i].to(torch.float32)
-            kx = kv_cache[block_idx].to(torch.float32).squeeze(1)
+            phys_block = block_table[b, block_rk].item()
+            qx = q[b].to(torch.float32)                     # [next_n, heads, head_dim]
+            kx = kv_cache[phys_block].to(torch.float32).squeeze(1)  # [block_size, head_dim]
 
-            k_offsets = torch.arange(block_rk * block_size, (block_rk + 1) * block_size, device=q.device)
+            k_offsets = torch.arange(block_rk * block_size,
+                                     (block_rk + 1) * block_size,
+                                     device=q.device)
+
+            # causal mask: only positions <= query offset are valid
             mask = (k_offsets[None, :] < ctx_len) & (k_offsets[None, :] <= q_offsets[:, None])
 
-            s = torch.where(
+            # Compute scores: [next_n, heads, block_size]
+            scores = torch.where(
                 mask[None, :, :],
                 (qx.transpose(0, 1) @ kx.T).to(logits.dtype),
                 float('-inf'),
             )
-            s = torch.relu(s) * weight_slice[..., None]
-            s = s.sum(dim=0)
+            scores = torch.relu(scores) * weight_slice[..., None]
+            scores = scores.sum(dim=0)   # sum over heads → [next_n, block_size]
 
-            logits[i * next_n:(i + 1) * next_n, block_rk * block_size:(block_rk + 1) * block_size] = \
-                torch.where(k_offsets[None, :] <= q_offsets[:, None], s, float('-inf'))
+            # Write to logits, again masking invalid positions
+            logits[b * next_n:(b + 1) * next_n,
+                   block_rk * block_size:(block_rk + 1) * block_size] = \
+                torch.where(k_offsets[None, :] <= q_offsets[:, None],
+                            scores,
+                            float('-inf'))
 
     return logits
 
 
 # ============================================================================
-# High-level interface (tilelang)
+# TileLang High-Level Interface
 # ============================================================================
 
 _kernel_cache = {}
@@ -257,66 +287,77 @@ def run_tilelang(
     max_context_len: int,
     clean_logits: bool = True,
 ):
-    """Run the tilelang paged_mqa_logits kernel (BF16). next_n=1 only."""
-    batch_size, next_n, heads, index_dim = q.shape
-    assert next_n == 1
+    """
+    Run the tilelang paged_mqa_logits kernel (BF16). Requires next_n == 1.
+    """
+    batch_size, next_n, heads, head_dim = q.shape
+    assert next_n == 1, "Only next_n=1 is supported."
 
-    block_N, num_stages, lds_bytes = _pick_block_config(heads, index_dim)
+    # Pick optimal tiling configuration
+    block_N, num_stages, lds_bytes = _pick_block_config(heads, head_dim)
 
-    # For small batch sizes, use block_N=64 + FullRow policy to process
-    # an entire KV block in one shot. FullRow assigns each warp its own
-    # [16, 128] × [H, 128]^T tile (matching lightop's warp structure),
-    # while eliminating Pipelined barrier overhead.
+    # For very small batches, we can use a larger tile and FullRow policy
     use_full_row = False
     if batch_size <= 4 and block_N == 32:
-        q_smem = heads * index_dim * 2
-        k_smem_64 = 64 * index_dim * 2
+        q_smem = heads * head_dim * 2
+        k_smem_64 = 64 * head_dim * 2
         if q_smem + k_smem_64 <= LDS_LIMIT:
             block_N = 64
             num_stages = 0
             lds_bytes = q_smem + k_smem_64
             use_full_row = True
 
-    cache_key = (heads, index_dim, block_N, num_stages, use_full_row)
+    # Cache and compile the kernel
+    cache_key = (heads, head_dim, block_N, num_stages, use_full_row)
     if cache_key not in _kernel_cache:
         policy_str = "full_row" if use_full_row else "square"
-        print(f"  [tilelang config] H={heads}, D={index_dim}, "
+        print(f"  [tilelang config] H={heads}, dim={head_dim}, "
               f"block_N={block_N}, num_stages={num_stages}, policy={policy_str}, "
               f"LDS={lds_bytes / 1024:.1f}KB / {LDS_LIMIT / 1024:.0f}KB")
         _kernel_cache[cache_key] = paged_mqa_logits_kernel(
-            heads=heads, index_dim=index_dim,
-            block_N=block_N, num_stages=num_stages,
+            heads=heads,
+            head_dim=head_dim,
+            block_N=block_N,
+            num_stages=num_stages,
             policy=policy_str,
         )
 
     logits_kernel = _kernel_cache[cache_key]
 
+    # Allocate output logits (pre-filled with -inf if cleaning)
     if clean_logits:
         logits = torch.full(
             [batch_size, max_context_len],
-            float("-inf"), device=q.device, dtype=torch.float32,
+            float("-inf"),
+            device=q.device,
+            dtype=torch.float32,
         )
     else:
         logits = torch.empty(
             [batch_size, max_context_len],
-            device=q.device, dtype=torch.float32,
+            device=q.device,
+            dtype=torch.float32,
         )
 
+    # Launch kernel
     logits_kernel(
-        q.view(batch_size, heads, index_dim),  # [batch_size, next_n, heads, D] → [batch_size, heads, D]
-        kv_cache, logits, weights.view(batch_size, heads), block_table,
+        q.view(batch_size, heads, head_dim),  # flatten next_n
+        kv_cache,
+        logits,
+        weights.view(batch_size, heads),
+        block_table,
     )
 
+    # Optionally mask positions beyond context length
     if clean_logits:
-        clean_kernel = clean_paged_logits_tl()
+        clean_kernel = clean_paged_logits()
         clean_kernel(logits, context_lens)
 
-    # Match lightop output shape: [batch_size * next_n, max_context_len]
     return logits.view(batch_size * next_n, max_context_len)
 
 
 # ============================================================================
-# Public API — vllm-compatible interface
+# Public API (vLLM-compatible)
 # ============================================================================
 
 def paged_mqa_logits(
@@ -329,46 +370,37 @@ def paged_mqa_logits(
     max_context_len: int = 0,
     clean_logits: bool = True,
 ) -> torch.Tensor:
-    """Compute paged MQA logits via tilelang, API-compatible with lightop.
-
-    Args:
-        q:               [batch_size, next_n, heads, head_dim]  BF16
-        fused_kv_cache:  [num_blocks, block_size, 1, head_dim]  BF16
-        weights:         [batch_size * next_n, heads]            float32
-        context_lens:    [batch_size]                            int32
-        block_table:     [batch_size, max_block_len]             int32
-        schedule_metadata:  [num_sms+1, 2] or None              int32 (ignored)
-        max_context_len: int
-        clean_logits:    bool
-
-    Returns:
-        logits:          [batch_size * next_n, max_context_len]  float32
+    """
+    Public interface matching lightop.gemmopt.paged_mqa_logits.
     """
     if max_context_len <= 0:
         max_context_len = fused_kv_cache.shape[1] * block_table.shape[1]
 
     return run_tilelang(
-        q, fused_kv_cache, weights, context_lens, block_table,
-        max_context_len, clean_logits=clean_logits,
+        q,
+        fused_kv_cache,
+        weights,
+        context_lens,
+        block_table,
+        max_context_len,
+        clean_logits=clean_logits,
     )
 
 
 # ============================================================================
-# lightop interface
+# Lightop Integration (optional)
 # ============================================================================
 
 try:
-    from lightop import op, gemmopt
+    from lightop import gemmopt
     HAS_LIGHTOP = True
 except ImportError:
     HAS_LIGHTOP = False
 
 
-def run_lightop(
-    q, kv_cache, weights, context_lens, block_table,
-    max_context_len, clean_logits=True,
-):
-    """Run the lightop paged_mqa_logits kernel."""
+def run_lightop(q, kv_cache, weights, context_lens, block_table,
+                max_context_len, clean_logits=True):
+    """Run lightop reference implementation."""
     num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
     schedule_meta = gemmopt.get_paged_mqa_logits_metadata(
         context_lens, block_kv=64, num_sms=num_sms,
@@ -380,10 +412,10 @@ def run_lightop(
 
 
 # ============================================================================
-# Correctness helpers
+# Correctness & Benchmark Helpers
 # ============================================================================
 
-def compute_correlation(a: torch.Tensor, b: torch.Tensor, label: str = "tensor") -> float:
+def compute_correlation(a: torch.Tensor, b: torch.Tensor) -> float:
     a, b = a.data.double(), b.data.double()
     norm_sum = (a * a + b * b).sum()
     if norm_sum == 0:
@@ -415,7 +447,7 @@ def bench_event(fn, warmup=10, rep=50):
 
 
 # ============================================================================
-# Test data generation
+# Test Data Generation
 # ============================================================================
 
 def create_test_data(
@@ -442,9 +474,10 @@ def create_test_data(
         device=device,
     ).to(torch.int32)
 
-    max_block_len = (context_lens.max().item() + block_size - 1) // block_size
-    block_table = torch.zeros(batch_size, max_block_len, device=device, dtype=torch.int32)
+    max_num_blocks = (context_lens.max().item() + block_size - 1) // block_size
+    block_table = torch.zeros(batch_size, max_num_blocks, device=device, dtype=torch.int32)
 
+    # Randomly assign physical blocks
     block_pool = list(range(num_blocks))
     random.shuffle(block_pool)
     counter = 0
@@ -458,22 +491,22 @@ def create_test_data(
 
 
 # ============================================================================
-# Validation
+# Correctness Validation
 # ============================================================================
 
 CORRECTNESS_CASES = [
-    ("bs1_H32_D128",          1,     1,      32,    128,  256),
-    ("bs1_H64_D128",          1,     1,      64,    128,  256),
-    ("bs2_H32_D128",          2,     1,      32,    128,  512),
-    ("bs4_H32_D128",          4,     1,      32,    128,  1024),
-    ("bs1_H32_D128_long",     1,     1,      32,    128,  4096),
-    ("bs1_H32_D128_tiny",     1,     1,      32,    128,  32),
-    ("bs1_H32_D128_small",    1,     1,      32,    128,  64),
-    ("unalign_99",            1,     1,      32,    128,  99),
-    ("unalign_257",           1,     1,      32,    128,  257),
-    ("unalign_500_H64",       1,     1,      64,    128,  500),
-    ("bs8_H32_D128",          8,     1,      32,    128,  2048),
-    ("bs32_H32_D128",         32,    1,      32,    128,  1024),
+    ("bs1_H32_D128",         1, 1, 32, 128, 256),
+    ("bs1_H64_D128",         1, 1, 64, 128, 256),
+    ("bs2_H32_D128",         2, 1, 32, 128, 512),
+    ("bs4_H32_D128",         4, 1, 32, 128, 1024),
+    ("bs1_H32_D128_long",    1, 1, 32, 128, 4096),
+    ("bs1_H32_D128_tiny",    1, 1, 32, 128, 32),
+    ("bs1_H32_D128_small",   1, 1, 32, 128, 64),
+    ("unalign_99",           1, 1, 32, 128, 99),
+    ("unalign_257",          1, 1, 32, 128, 257),
+    ("unalign_500_H64",      1, 1, 64, 128, 500),
+    ("bs8_H32_D128",         8, 1, 32, 128, 2048),
+    ("bs32_H32_D128",       32, 1, 32, 128, 1024),
 ]
 
 
@@ -499,54 +532,41 @@ def run_correctness_check(device="cuda"):
             q, kv_cache, weights, context_lens, block_table, max_model_len,
         )
 
-        diff_tl_lo = float('nan')
-        mask_match = False
-        if HAS_LIGHTOP:
-            logits_lo = run_lightop(
-                q, kv_cache, weights, context_lens, block_table, max_model_len, clean_logits=True,
-            )
-            tl_neginf = (logits_tl == float('-inf'))
-            lo_neginf = (logits_lo == float('-inf'))
-            mask_match = torch.equal(tl_neginf, lo_neginf)
-
-            both_neginf = tl_neginf & lo_neginf
-            diff_tl_lo = calc_diff(
-                logits_tl.masked_fill(both_neginf, 0),
-                logits_lo.masked_fill(both_neginf, 0),
-            )
-        else:
+        if not HAS_LIGHTOP:
             print("  lightop not available, skipping")
             continue
 
-        status = "PASS" if (diff_tl_lo < 1e-3 and mask_match) else "FAIL"
+        logits_lo = run_lightop(
+            q, kv_cache, weights, context_lens, block_table, max_model_len, clean_logits=True,
+        )
+
+        tl_neginf = (logits_tl == float('-inf'))
+        lo_neginf = (logits_lo == float('-inf'))
+        mask_match = torch.equal(tl_neginf, lo_neginf)
+
+        both_neginf = tl_neginf & lo_neginf
+        diff = calc_diff(
+            logits_tl.masked_fill(both_neginf, 0),
+            logits_lo.masked_fill(both_neginf, 0),
+        )
+
+        status = "PASS" if (diff < 1e-3 and mask_match) else "FAIL"
         max_abs_err = (logits_tl.float() - logits_lo.float()).abs().max().item()
         print(f"{name:<22} {batch_size:>4} {heads:>4} {head_dim:>4} {avg_ctx:>8}  "
-              f"{diff_tl_lo:>12.2e}  {str(mask_match):>8}  [{status}]  max_err={max_abs_err:.4e}")
+              f"{diff:>12.2e}  {str(mask_match):>8}  [{status}]  max_err={max_abs_err:.4e}")
 
         if status == "FAIL":
-            # Debug: print first few values
+            # Debug info for first failure
             print(f"    DEBUG tl[0,:8]={logits_tl[0,:8].tolist()}")
             print(f"    DEBUG lo[0,:8]={logits_lo[0,:8].tolist()}")
-            tl_fin = torch.isfinite(logits_tl)
-            lo_fin = torch.isfinite(logits_lo)
-            print(f"    DEBUG tl finite: {tl_fin.sum().item()}, lo finite: {lo_fin.sum().item()}")
-            if tl_fin.any():
-                print(f"    DEBUG tl finite range: [{logits_tl[tl_fin].min().item():.4f}, {logits_tl[tl_fin].max().item():.4f}]")
-            if lo_fin.any():
-                print(f"    DEBUG lo finite range: [{logits_lo[lo_fin].min().item():.4f}, {logits_lo[lo_fin].max().item():.4f}]")
             # Also check reference
             logits_ref = ref_paged_mqa_logits(
                 q, kv_cache, weights, context_lens, block_table, max_model_len,
             )
             print(f"    DEBUG ref[0,:8]={logits_ref[0,:8].tolist()}")
-            ref_fin = torch.isfinite(logits_ref)
-            print(f"    DEBUG ref finite: {ref_fin.sum().item()}")
-            if ref_fin.any():
-                print(f"    DEBUG ref finite range: [{logits_ref[ref_fin].min().item():.4f}, {logits_ref[ref_fin].max().item():.4f}]")
-            # Only debug first failure
             break
 
-        if not (diff_tl_lo < 1e-3 and mask_match):
+        if status == "FAIL":
             all_pass = False
             failed.append(name)
 
@@ -563,13 +583,13 @@ def run_correctness_check(device="cuda"):
 # ============================================================================
 
 BENCHMARK_CASES = [
-    ("bs1_H32_D128_4k",       1,     1,      32,    128,  4096),
-    ("bs64_H32_D128_4k",      64,    1,      32,    128,  4096),
-    ("bs128_H32_D128_4k",     128,   1,      32,    128,  4096),
-    ("bs1_H64_D128_4k",       1,     1,      64,    128,  4096),
-    ("bs64_H64_D128_4k",      64,    1,      64,    128,  4096),
-    ("bs1_H32_D128_72k",      1,     1,      32,    128,  72000),
-    ("bs1_H64_D128_72k",      1,     1,      64,    128,  72000),
+    ("bs1_H32_D128_4k",      1, 1, 32, 128, 4096),
+    ("bs64_H32_D128_4k",    64, 1, 32, 128, 4096),
+    ("bs128_H32_D128_4k",  128, 1, 32, 128, 4096),
+    ("bs1_H64_D128_4k",      1, 1, 64, 128, 4096),
+    ("bs64_H64_D128_4k",    64, 1, 64, 128, 4096),
+    ("bs1_H32_D128_72k",     1, 1, 32, 128, 72000),
+    ("bs1_H64_D128_72k",     1, 1, 64, 128, 72000),
 ]
 
 
@@ -614,15 +634,19 @@ def run_benchmark(name, batch_size, next_n, heads, head_dim, avg_ctx, warmup, re
     }
 
 
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
 def main():
     parser = argparse.ArgumentParser(
         description="Benchmark tilelang vs lightop HIP ASM paged_mqa_logits (BF16)"
     )
-    parser.add_argument("--validate", action="store_true")
-    parser.add_argument("--benchmark", action="store_true", default=False)
-    parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--rep", type=int, default=50)
-    parser.add_argument("--csv", type=str, default=None)
+    parser.add_argument("--validate", action="store_true", help="Run correctness validation")
+    parser.add_argument("--benchmark", action="store_true", default=False, help="Run performance benchmark")
+    parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations")
+    parser.add_argument("--rep", type=int, default=50, help="Measurement iterations")
+    parser.add_argument("--csv", type=str, default=None, help="Save results to CSV")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():

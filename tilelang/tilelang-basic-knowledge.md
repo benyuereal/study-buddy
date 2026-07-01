@@ -1,8 +1,8 @@
-# TileLang 核心关键字与概念
+# TileLang 原语指令及概念
 
 ## 文档定位
 
-本文档是 TileLang 关键字的**速查手册**，逐个解释每个原语的语法、语义、与 GPU 硬件的对应关系，以及使用场景。面向具备 GPU 基础知识的开发者（Expert 层级），提供线程级精确控制。
+逐个讲解 TileLang 原语的语法、语义、与 GPU 硬件的对应关系及使用场景。面向具备 GPU 基础知识的开发者（Expert 层级），提供线程级精确控制。
 
 阅读前请先理解 [GPU 基础概念](./gpu-basic-knowledge.md)（Grid、Block、Wave、Shared Memory/LDS、寄存器、Tiling 等）。本文档以海光 DCU 为主要目标硬件，LDS 默认 64 KB/CU，Wave 为 64 线程。
 
